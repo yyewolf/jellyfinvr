@@ -14,6 +14,7 @@
   const PANEL_HEIGHT = 0.82;
   const PANEL_HOME = { x: 0, y: -0.13, z: -1.32 };
   const TIMELINE = { x: 80, y: 164, width: 1440, height: 76, trackY: 192, trackHeight: 20 };
+  const PROGRESS_INTERVAL = 10000;
 
   let overlay = null;
   let statusEl = null;
@@ -26,6 +27,10 @@
   let sourceMode = 'original';
   let savedVideoId = '';
   let loadSerial = 0;
+  let jellyfin = null;
+  let compatSessionId = '';
+  let progressTimer = 0;
+  let lastReportKey = '';
 
   let world = null;
   let camera = null;
@@ -78,13 +83,13 @@
         document.head.appendChild(script);
       }
       script.addEventListener('load', resolve, { once: true });
-      script.addEventListener('error', () => reject(new Error('Three.js 加载失败')), { once: true });
+      script.addEventListener('error', () => reject(new Error('Failed to load Three.js')), { once: true });
     });
   }
 
   async function ensureThree() {
     if (!window.THREE?.WebGLRenderer) await loadScript(THREE_URL);
-    if (!window.THREE?.WebGLRenderer) throw new Error('Three.js 初始化失败');
+    if (!window.THREE?.WebGLRenderer) throw new Error('Three.js failed to initialise');
   }
 
   function findVideo() {
@@ -109,6 +114,114 @@
       if (key.toLowerCase() === name.toLowerCase()) url.searchParams.delete(key);
     });
     if (value !== null && value !== undefined) url.searchParams.set(name, String(value));
+  }
+
+  function readQueryParam(url, name) {
+    const key = Array.from(url.searchParams.keys()).find((item) => item.toLowerCase() === name.toLowerCase());
+    return key ? url.searchParams.get(key) || '' : '';
+  }
+
+  // Everything needed to talk to the Jellyfin API is already present in the
+  // stream URL Jellyfin built for its own player; ApiClient only fills gaps.
+  function readJellyfinContext(video) {
+    const raw = video?.currentSrc || video?.src;
+    if (!raw) return null;
+    let url;
+    try {
+      url = new URL(raw, location.href);
+    } catch (_) {
+      return null;
+    }
+    const match = url.pathname.match(/^(.*)\/Videos\/([^/]+)\/stream(?:\.[^/]*)?$/i);
+    if (!match) return null;
+    const context = {
+      base: `${url.origin}${match[1]}`,
+      itemId: match[2],
+      mediaSourceId: readQueryParam(url, 'MediaSourceId') || match[2],
+      playSessionId: readQueryParam(url, 'PlaySessionId'),
+      apiKey: readQueryParam(url, 'api_key') || readQueryParam(url, 'ApiKey'),
+      deviceId: readQueryParam(url, 'DeviceId')
+    };
+    const client = window.ApiClient;
+    if (client) {
+      try { if (!context.apiKey) context.apiKey = client.accessToken?.() || ''; } catch (_) {}
+      try { if (!context.deviceId) context.deviceId = client.deviceId?.() || ''; } catch (_) {}
+    }
+    return context.apiKey ? context : null;
+  }
+
+  async function jellyfinRequest(method, path, body) {
+    if (!jellyfin?.apiKey) return false;
+    const headers = { 'X-Emby-Token': jellyfin.apiKey };
+    if (body) headers['Content-Type'] = 'application/json';
+    try {
+      // keepalive so teardown requests still leave during page hide/unload.
+      const response = await fetch(`${jellyfin.base}${path}`, {
+        method,
+        headers,
+        body: body ? JSON.stringify(body) : undefined,
+        keepalive: true
+      });
+      return response.ok;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  // Jellyfin stops advancing watch history while its own <video> is parked, so
+  // the compat source has to report its position itself.
+  function reportProgress(eventName) {
+    if (sourceMode !== 'compat' || !jellyfin?.playSessionId || !activeVideo) return;
+    const ticks = Math.max(0, Math.round(getCurrentTime() * 10000000));
+    const paused = Boolean(activeVideo.paused);
+    const key = `${ticks}|${paused}`;
+    if (key === lastReportKey) return;
+    lastReportKey = key;
+    jellyfinRequest('POST', '/Sessions/Playing/Progress', {
+      ItemId: jellyfin.itemId,
+      MediaSourceId: jellyfin.mediaSourceId,
+      PlaySessionId: jellyfin.playSessionId,
+      PositionTicks: ticks,
+      IsPaused: paused,
+      IsMuted: Boolean(activeVideo.muted),
+      VolumeLevel: Math.round((activeVideo.volume ?? 1) * 100),
+      CanSeek: true,
+      PlayMethod: 'Transcode',
+      EventName: eventName || 'timeupdate'
+    });
+  }
+
+  function startProgressReporting() {
+    stopProgressReporting();
+    progressTimer = setInterval(() => reportProgress('timeupdate'), PROGRESS_INTERVAL);
+  }
+
+  function stopProgressReporting() {
+    if (progressTimer) clearInterval(progressTimer);
+    progressTimer = 0;
+  }
+
+  function newCompatSessionId() {
+    let random = '';
+    try { random = crypto.randomUUID().replace(/-/g, ''); } catch (_) {}
+    if (!random) random = `${Date.now().toString(16)}${Math.random().toString(16).slice(2)}`;
+    return `jvr${random}`.slice(0, 40);
+  }
+
+  // Only ever kills our own transcode: the id passed here is always one we
+  // generated, never Jellyfin's PlaySessionId, so this cannot stop the
+  // original stream the Jellyfin player is using.
+  function stopEncoding(sessionId) {
+    if (!sessionId) return;
+    const params = new URLSearchParams();
+    if (jellyfin?.deviceId) params.set('deviceId', jellyfin.deviceId);
+    params.set('playSessionId', sessionId);
+    jellyfinRequest('DELETE', `/Videos/ActiveEncodings?${params.toString()}`);
+  }
+
+  function stopCompatEncoding() {
+    stopEncoding(compatSessionId);
+    compatSessionId = '';
   }
 
   function buildCompatStreamUrl(video) {
@@ -194,20 +307,20 @@
     version.className = 'jvr-label';
     version.textContent = 'Jellyfin VR v4.2';
     bar.append(version);
-    [['360°', '360'], ['180° 经编', '180'], ['180° 鱼眼', 'fisheye'], ['影院', 'flat']]
+    [['360', '360'], ['180 Equirect', '180'], ['180 Fisheye', 'fisheye'], ['Cinema', 'flat']]
       .forEach(([label, value]) => bar.append(createButton(label, 'projection', value)));
-    [['单眼', 'mono'], ['SBS', 'sbs'], ['OU', 'ou']]
+    [['Mono', 'mono'], ['SBS', 'sbs'], ['OU', 'ou']]
       .forEach(([label, value]) => bar.append(createButton(label, 'stereo', value)));
-    bar.append(createButton('交换眼睛', 'swap'));
-    const source = createButton('原始源', 'source');
+    bar.append(createButton('Swap Eyes', 'swap'));
+    const source = createButton('Original Source', 'source');
     source.id = 'jvr-source-toggle';
     bar.append(source);
-    const enter = createButton('进入 VR', 'enter');
+    const enter = createButton('Enter VR', 'enter');
     enter.className = 'jvr-enter';
     bar.append(enter);
     statusEl = document.createElement('div');
     statusEl.className = 'jvr-status';
-    statusEl.textContent = '正在初始化原生 WebXR 渲染器…';
+    statusEl.textContent = 'Initialising the native WebXR renderer...';
     overlay.append(bar, statusEl);
     document.body.appendChild(overlay);
     bar.addEventListener('click', handleToolbar);
@@ -327,7 +440,7 @@
     context.fillStyle = '#5edcff';
     context.font = '28px system-ui, sans-serif';
     context.textAlign = 'right';
-    context.fillText('按住边框拖动面板', 1530, 52);
+    context.fillText('Hold the border to move this panel', 1530, 52);
     context.fillStyle = '#fff';
     context.textAlign = 'center';
     context.textBaseline = 'middle';
@@ -365,7 +478,7 @@
     addPanelButton(1165, 435, 380, 105, 'EXIT VR', 'exit-vr', '#652d34');
     context.fillStyle = '#81909f';
     context.font = '36px system-ui, sans-serif';
-    context.fillText('时间轴：按住拖动  ·  长按扳机拖动画面  ·  长按握柄：全部复位', 800, 635);
+    context.fillText('Timeline: hold to scrub  ·  Hold trigger to pan the view  ·  Hold grip to reset', 800, 635);
     panelTexture.needsUpdate = true;
   }
 
@@ -761,7 +874,7 @@
       panelMesh.scale.set(1, 1, 1);
     }
     showPanel();
-    if (statusEl) statusEl.textContent = '控制面板和视频视角已复位。';
+    if (statusEl) statusEl.textContent = 'Control panel and view orientation reset.';
     drawPanel();
   }
 
@@ -781,35 +894,55 @@
   function bindMediaEvents(video, enabled) {
     if (!video) return;
     const method = enabled ? 'addEventListener' : 'removeEventListener';
-    video[method]('timeupdate', drawPanel);
-    video[method]('play', handleMediaReady);
-    video[method]('pause', drawPanel);
+    video[method]('timeupdate', handleMediaTimeUpdate);
+    video[method]('play', handleMediaPlay);
+    video[method]('pause', handleMediaPause);
     video[method]('loadedmetadata', handleMediaReady);
     video[method]('canplay', handleMediaReady);
     video[method]('error', handleMediaError);
   }
 
+  function handleMediaTimeUpdate() {
+    if (this !== activeVideo) return;
+    drawPanel();
+  }
+
+  function handleMediaPlay() {
+    if (this !== activeVideo) return;
+    handleMediaReady.call(this);
+    reportProgress('unpause');
+  }
+
+  function handleMediaPause() {
+    if (this !== activeVideo) return;
+    drawPanel();
+    reportProgress('pause');
+  }
+
   function handleMediaReady() {
     if (this !== activeVideo) return;
     replaceVideoTexture(activeVideo);
-    const label = sourceMode === 'compat' ? 'H.264/8-bit 兼容源' : '原始源';
-    statusEl.textContent = `${label}已连接 · ${activeVideo.videoWidth || '?'}×${activeVideo.videoHeight || '?'} · 可进入 VR`;
+    const label = sourceMode === 'compat' ? 'H.264/8-bit compatibility source' : 'Original source';
+    statusEl.textContent = `${label} connected · ${activeVideo.videoWidth || '?'}×${activeVideo.videoHeight || '?'} · ready to enter VR`;
     drawPanel();
   }
 
   function handleMediaError() {
     if (this !== activeVideo) return;
     const code = activeVideo.error?.code;
-    statusEl.textContent = `视频源播放失败${code ? `（MediaError ${code}）` : ''}，请检查 Jellyfin 转码日志。`;
+    statusEl.textContent = `Video source playback failed${code ? ` (MediaError ${code})` : ''}. Check the Jellyfin transcoding log.`;
   }
 
   async function startCompatAt(position, shouldPlay = true) {
-    if (!compatUrl) throw new Error('当前地址无法生成 Jellyfin H264 兼容源');
+    if (!compatUrl) throw new Error('Cannot derive a Jellyfin H.264 compatibility source from this URL');
     const serial = ++loadSerial;
     const duration = getDuration();
     const target = Math.max(0, Math.min(Number(position) || 0, duration ? duration - 0.25 : Infinity));
     const url = new URL(compatUrl);
     setQueryParam(url, 'StartTimeTicks', Math.round(target * 10000000));
+    const previousSessionId = compatSessionId;
+    compatSessionId = newCompatSessionId();
+    setQueryParam(url, 'PlaySessionId', compatSessionId);
     const muted = activeVideo?.muted ?? sourceVideo.muted;
     const volume = activeVideo?.volume ?? sourceVideo.volume;
     bindMediaEvents(activeVideo, false);
@@ -819,6 +952,7 @@
       compatVideo.load();
       compatVideo.remove();
     }
+    stopEncoding(previousSessionId);
     compatVideo = document.createElement('video');
     compatVideo.id = 'jvr-compat-video';
     compatVideo.preload = 'auto';
@@ -835,21 +969,27 @@
     overlay.appendChild(compatVideo);
     replaceVideoTexture(activeVideo);
     updateToolbar();
-    statusEl.textContent = `正在从 ${formatTime(target)} 启动 H.264/8-bit 转码…`;
+    statusEl.textContent = `Starting H.264/8-bit transcode from ${formatTime(target)}...`;
     compatVideo.src = url.href;
     compatVideo.load();
+    lastReportKey = '';
+    startProgressReporting();
     if (shouldPlay) {
       try {
         await compatVideo.play();
       } catch (_) {
-        if (serial === loadSerial) statusEl.textContent = '兼容源已建立；请按 PLAY 开始播放。';
+        if (serial === loadSerial) statusEl.textContent = 'Compatibility source ready. Press PLAY to start.';
       }
     }
+    reportProgress('timeupdate');
   }
 
   async function useOriginalSource() {
     const position = getCurrentTime();
     const shouldPlay = !activeVideo?.paused;
+    reportProgress('timeupdate');
+    stopProgressReporting();
+    stopCompatEncoding();
     const muted = activeVideo?.muted ?? false;
     const volume = activeVideo?.volume ?? 1;
     ++loadSerial;
@@ -863,7 +1003,7 @@
     bindMediaEvents(activeVideo, true);
     replaceVideoTexture(activeVideo);
     updateToolbar();
-    statusEl.textContent = '已切回原始源。';
+    statusEl.textContent = 'Switched back to the original source.';
     if (shouldPlay) await sourceVideo.play().catch(() => {});
   }
 
@@ -873,7 +1013,7 @@
     const shouldPlay = !activeVideo?.paused;
     if (sourceMode === 'compat') useOriginalSource();
     else startCompatAt(position, shouldPlay).catch((error) => {
-      statusEl.textContent = `兼容源启动失败：${error?.message || error}`;
+      statusEl.textContent = `Compatibility source failed to start: ${error?.message || error}`;
     });
   }
 
@@ -886,9 +1026,10 @@
     const relative = target - compatOffset;
     if (relative >= 0 && Number.isFinite(activeVideo.duration) && relative <= activeVideo.duration) {
       activeVideo.currentTime = relative;
+      reportProgress('timeupdate');
     } else {
       startCompatAt(target, !activeVideo.paused).catch((error) => {
-        statusEl.textContent = `兼容源跳转失败：${error?.message || error}`;
+        statusEl.textContent = `Compatibility source seek failed: ${error?.message || error}`;
       });
     }
   }
@@ -931,16 +1072,16 @@
     });
     const sourceButton = overlay.querySelector('#jvr-source-toggle');
     if (sourceButton) {
-      sourceButton.textContent = sourceMode === 'compat' ? 'H264 兼容源 ✓' : '原始源';
+      sourceButton.textContent = sourceMode === 'compat' ? 'H.264 Compat ✓' : 'Original Source';
       sourceButton.classList.toggle('active', sourceMode === 'compat');
       sourceButton.disabled = !compatUrl;
     }
   }
 
   async function enterVr() {
-    if (!window.isSecureContext) return alert('WebXR 需要 HTTPS。');
-    if (!navigator.xr) return alert('当前浏览器没有 WebXR。');
-    if (!renderer) return alert('WebXR 渲染器尚未初始化。');
+    if (!window.isSecureContext) return alert('WebXR requires HTTPS.');
+    if (!navigator.xr) return alert('This browser does not support WebXR.');
+    if (!renderer) return alert('The WebXR renderer is not initialised yet.');
     try {
       // requestSession must run directly in the Enter VR click's user-activation task.
       const sessionPromise = navigator.xr.requestSession('immersive-vr', {
@@ -951,13 +1092,13 @@
       xrSession.addEventListener('end', () => {
         xrSession = null;
         hidePanel();
-        if (!closing && statusEl) statusEl.textContent = '已退出 VR，可再次进入或返回 Jellyfin。';
+        if (!closing && statusEl) statusEl.textContent = 'Exited VR. You can re-enter or go back to Jellyfin.';
       }, { once: true });
       await renderer.xr.setSession(xrSession);
-      statusEl.textContent = '已进入原生 WebXR。按扳机打开控制面板。';
+      statusEl.textContent = 'Native WebXR active. Press the trigger to open the control panel.';
       setTimeout(showPanel, 350);
     } catch (error) {
-      alert(`进入 VR 失败：${error?.message || error}`);
+      alert(`Failed to enter VR: ${error?.message || error}`);
     }
   }
 
@@ -984,9 +1125,10 @@
   async function openPlayer() {
     if (overlay) return;
     sourceVideo = findVideo();
-    if (!sourceVideo) return alert('请先在 Jellyfin 中开始播放视频。');
+    if (!sourceVideo) return alert('Start playing a video in Jellyfin first.');
     try {
       activeVideo = sourceVideo;
+      jellyfin = readJellyfinContext(sourceVideo);
       compatUrl = buildCompatStreamUrl(sourceVideo);
       originalState = {
         currentTime: sourceVideo.currentTime || 0,
@@ -1003,11 +1145,11 @@
       bindMediaEvents(sourceVideo, true);
       replaceVideoTexture(sourceVideo);
       updateToolbar();
-      statusEl.textContent = `原生 WebXR 已就绪 · 原始源 ${sourceVideo.videoWidth || '?'}×${sourceVideo.videoHeight || '?'}`;
+      statusEl.textContent = `Native WebXR ready · original source ${sourceVideo.videoWidth || '?'}×${sourceVideo.videoHeight || '?'}`;
       sourceVideo.play().catch(() => {});
     } catch (error) {
       closePlayer();
-      alert(`VR 播放器初始化失败：${error?.message || error}`);
+      alert(`VR player failed to initialise: ${error?.message || error}`);
     }
   }
 
@@ -1017,6 +1159,9 @@
     const finalTime = getCurrentTime();
     const finalMuted = activeVideo?.muted;
     const finalVolume = activeVideo?.volume;
+    reportProgress('timeupdate');
+    stopProgressReporting();
+    stopCompatEncoding();
     const session = xrSession || renderer?.xr?.getSession?.();
     session?.end?.().catch?.(() => {});
     xrSession = null;
@@ -1072,6 +1217,8 @@
     compatOffset = 0;
     sourceMode = 'original';
     savedVideoId = '';
+    jellyfin = null;
+    lastReportKey = '';
     world = null;
     camera = null;
     renderer = null;
@@ -1137,6 +1284,11 @@
     new MutationObserver(scan).observe(document.documentElement, { childList: true, subtree: true });
     scanTimer = setInterval(scan, 1000);
     window.addEventListener('beforeunload', () => clearInterval(scanTimer), { once: true });
+    window.addEventListener('pagehide', () => {
+      reportProgress('timeupdate');
+      stopProgressReporting();
+      stopCompatEncoding();
+    });
   }
 
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init, { once: true });
