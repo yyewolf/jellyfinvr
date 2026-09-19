@@ -25,6 +25,23 @@
   const METADATA_TIMEOUT = 2500;
   const ENV_STORE_KEY = 'jvr.env.v1';
   const ENVIRONMENTS = ['void', 'theater'];
+  const QUALITY_STORE_KEY = 'jvr.quality.v1';
+  // The compatibility source is our own transcode, so "quality" is a resolution
+  // cap plus a bitrate ceiling. A VR frame carries both eyes in one picture, so
+  // the ladder is named by the packed frame width rather than by a 16:9
+  // marketing tier: "4K" here is a 3840-wide frame, which is only 1920 per eye
+  // once side-by-side is unpacked. 4096 is the practical ceiling — the largest
+  // frame the H.264 decoders in standalone headsets reliably accept.
+  const QUALITY_PRESETS = [
+    { id: 'max', label: 'MAX', cap: 4096, bitrate: 60000000, note: 'Source resolution, capped at 4096px' },
+    { id: '4k', label: '4K', cap: 3840, bitrate: 40000000, note: '3840px frame · 40 Mbps' },
+    { id: '2.5k', label: '2.5K', cap: 2560, bitrate: 20000000, note: '2560px frame · 20 Mbps' },
+    { id: '1080', label: '1080', cap: 1920, bitrate: 10000000, note: '1920px frame · 10 Mbps' },
+    { id: '720', label: '720', cap: 1280, bitrate: 4000000, note: '1280px frame · 4 Mbps' }
+  ];
+  // Panel button rows, in canvas pixels. Widths are derived per row so adding a
+  // button does not mean re-deriving every x by hand.
+  const PANEL_ROW = { left: 55, width: 1490, gap: 18, height: 102, y: [250, 372, 494] };
   const EYE_HEIGHT = 1.6;
   // Screen placement per environment, in videoRoot-local space (origin at eye
   // height). `curveRatio` is the cylinder radius as a multiple of the viewing
@@ -66,6 +83,7 @@
   let compatUrl = '';
   let compatOffset = 0;
   let sourceMode = 'original';
+  let qualityId = 'max';
   let savedVideoId = '';
   let loadSerial = 0;
   let jellyfin = null;
@@ -469,11 +487,10 @@
       setQueryParam(url, 'AllowAudioStreamCopy', 'false');
       setQueryParam(url, 'MaxVideoBitDepth', '8');
       setQueryParam(url, 'RequireAvc', 'true');
-      setQueryParam(url, 'VideoBitRate', '40000000');
       setQueryParam(url, 'AudioBitRate', '320000');
       setQueryParam(url, 'AudioChannels', '2');
-      setQueryParam(url, 'MaxWidth', '4096');
-      setQueryParam(url, 'MaxHeight', '4096');
+      // Resolution and bitrate are applied per request by applyQualityParams,
+      // so changing quality only costs a transcode restart, not a rebuild.
       setQueryParam(url, 'Context', 'Streaming');
       setQueryParam(url, 'SubtitleStreamIndex', null);
       setQueryParam(url, 'SubtitleMethod', null);
@@ -506,6 +523,8 @@
       #${OVERLAY_ID} button{border:1px solid #ffffff45;border-radius:7px;background:#17191ddd;color:#fff;padding:8px 10px;font:inherit;cursor:pointer}
       #${OVERLAY_ID} button.active{border-color:#20b9ed;background:#075c78}
       #${OVERLAY_ID} button:disabled{opacity:.4;cursor:not-allowed}
+      #${OVERLAY_ID} select{border:1px solid #ffffff45;border-radius:7px;background:#17191ddd;color:#fff;padding:8px 10px;font:inherit;cursor:pointer}
+      #${OVERLAY_ID} select:disabled{opacity:.4;cursor:not-allowed}
       #${OVERLAY_ID} .jvr-enter{margin-left:auto;background:#008fbd;font-weight:700}
       #${OVERLAY_ID} .jvr-close{font-size:20px;padding:4px 12px}
       #${OVERLAY_ID} .jvr-status{position:absolute;left:50%;bottom:20px;z-index:5;transform:translateX(-50%);padding:8px 12px;border-radius:7px;background:#111e;color:#ccd3da;font-size:13px;white-space:nowrap;pointer-events:none}
@@ -546,6 +565,17 @@
     const source = createButton('Original Source', 'source');
     source.id = 'jvr-source-toggle';
     bar.append(source);
+    const quality = document.createElement('select');
+    quality.id = 'jvr-quality-select';
+    quality.dataset.action = 'quality';
+    QUALITY_PRESETS.forEach((preset) => {
+      const option = document.createElement('option');
+      option.value = preset.id;
+      option.textContent = `Quality: ${preset.label}`;
+      option.title = preset.note;
+      quality.append(option);
+    });
+    bar.append(quality);
     const enter = createButton('Enter VR', 'enter');
     enter.className = 'jvr-enter';
     bar.append(enter);
@@ -555,6 +585,7 @@
     overlay.append(bar, statusEl);
     document.body.appendChild(overlay);
     bar.addEventListener('click', handleToolbar);
+    bar.addEventListener('change', handleToolbarChange);
   }
 
   function createPanel() {
@@ -634,11 +665,24 @@
     context.lineWidth = hovered ? 5 : 2;
     context.stroke();
     context.fillStyle = '#fff';
-    context.font = '44px system-ui, sans-serif';
     context.textAlign = 'center';
     context.textBaseline = 'middle';
-    context.fillText(label, x + width / 2, y + height / 2);
+    fillFittedText(context, label, x + width / 2, y + height / 2, width - 28, 44, 24);
     panelButtons.push({ x, y, width, height, action });
+  }
+
+  // Lay out one row of buttons across the panel's full button span. `weight`
+  // widens a button relative to its neighbours; everything else divides evenly.
+  function addPanelRow(rowIndex, specs) {
+    const gaps = PANEL_ROW.gap * (specs.length - 1);
+    const total = specs.reduce((sum, spec) => sum + (spec.weight || 1), 0);
+    const unit = (PANEL_ROW.width - gaps) / total;
+    let x = PANEL_ROW.left;
+    for (const spec of specs) {
+      const width = unit * (spec.weight || 1);
+      addPanelButton(x, PANEL_ROW.y[rowIndex], width, PANEL_ROW.height, spec.label, spec.action, spec.color);
+      x += width + PANEL_ROW.gap;
+    }
   }
 
   function fillFittedText(context, text, centerX, centerY, maxWidth, startSize, minSize = 26) {
@@ -697,21 +741,36 @@
     context.strokeStyle = '#171d22';
     context.lineWidth = 5;
     context.stroke();
-    addPanelButton(55, 275, 170, 105, '-10', 'back');
-    addPanelButton(245, 275, 220, 105, activeVideo?.paused ? 'PLAY' : 'PAUSE', 'play', '#006f96');
-    addPanelButton(485, 275, 170, 105, '+10', 'forward');
-    addPanelButton(675, 275, 210, 105, activeVideo?.muted ? 'MUTED' : 'SOUND', 'mute');
-    addPanelButton(905, 275, 210, 105, currentMode.projection.toUpperCase(), 'projection');
-    addPanelButton(1135, 275, 180, 105, currentMode.stereo.toUpperCase(), 'stereo');
-    addPanelButton(1335, 275, 210, 105, sourceMode === 'compat' ? 'H264' : 'SOURCE', 'source', '#25536a');
-    addPanelButton(55, 435, 282, 105, 'SWAP EYES', 'swap');
-    addPanelButton(357, 435, 282, 105, environmentName.toUpperCase(), 'environment', '#2d4a40');
-    addPanelButton(659, 435, 282, 105, 'RESET ALL', 'reset', '#365061');
-    addPanelButton(961, 435, 282, 105, 'HIDE PANEL', 'hide');
-    addPanelButton(1263, 435, 282, 105, 'EXIT VR', 'exit-vr', '#652d34');
+    addPanelRow(0, [
+      { label: '-10', action: 'back' },
+      { label: activeVideo?.paused ? 'PLAY' : 'PAUSE', action: 'play', weight: 1.4, color: '#006f96' },
+      { label: '+10', action: 'forward' },
+      { label: activeVideo?.muted ? 'MUTED' : 'SOUND', action: 'mute' },
+      { label: currentMode.projection.toUpperCase(), action: 'projection' },
+      { label: currentMode.stereo.toUpperCase(), action: 'stereo' }
+    ]);
+    addPanelRow(1, [
+      { label: 'SWAP EYES', action: 'swap' },
+      { label: environmentName.toUpperCase(), action: 'environment', color: '#2d4a40' },
+      { label: sourceMode === 'compat' ? 'H264' : 'SOURCE', action: 'source', color: '#25536a' },
+      { label: currentQuality().label, action: 'quality', color: '#25536a' }
+    ]);
+    addPanelRow(2, [
+      { label: 'RECENTER', action: 'recenter', color: '#365061' },
+      { label: 'RESET ALL', action: 'reset', color: '#365061' },
+      { label: 'HIDE PANEL', action: 'hide' },
+      { label: 'EXIT VR', action: 'exit-vr', color: '#652d34' }
+    ]);
     context.fillStyle = '#81909f';
-    context.font = '36px system-ui, sans-serif';
-    context.fillText('Timeline: hold to scrub  ·  Hold trigger to pan the view  ·  Hold grip to reset', 800, 635);
+    fillFittedText(
+      context,
+      'Timeline: hold to scrub  ·  Trigger-drag to aim the view  ·  Thumbstick click to recentre',
+      800,
+      652,
+      1480,
+      34,
+      22
+    );
     panelTexture.needsUpdate = true;
   }
 
@@ -1824,6 +1883,8 @@
       const pressed = gamepad.buttons.map((button) => button.pressed);
       if (pressed[4] && !previous[4]) runAction('play');
       if (pressed[5] && !previous[5]) panelVisible ? hidePanel() : showPanel();
+      // Index 3 is the thumbstick click in the xr-standard mapping.
+      if (pressed[3] && !previous[3]) recenterView();
       const x = Math.abs(gamepad.axes[2] || 0) > Math.abs(gamepad.axes[0] || 0) ? gamepad.axes[2] : gamepad.axes[0];
       if (Date.now() - lastStickAction > 650) {
         if (x > 0.8) { lastStickAction = Date.now(); runAction('forward'); }
@@ -1854,15 +1915,43 @@
     });
   }
 
+  // Recentring in a headset means bringing the content to the viewer, never
+  // moving the viewer: the XR camera pose is owned by the runtime and writing
+  // to camera.position has no effect while presenting. So read where the head
+  // actually is in the tracking space and put videoRoot's origin there.
+  function headPose() {
+    if (!renderer?.xr?.isPresenting || !camera) return null;
+    const xrCamera = renderer.xr.getCamera(camera);
+    if (!xrCamera) return null;
+    const position = new THREE.Vector3();
+    const quaternion = new THREE.Quaternion();
+    xrCamera.getWorldPosition(position);
+    xrCamera.getWorldQuaternion(quaternion);
+    const forward = new THREE.Vector3(0, 0, -1).applyQuaternion(quaternion);
+    // Yaw only: a pitched or rolled head would tip the room off its own floor.
+    return { position, yaw: Math.atan2(-forward.x, -forward.z) };
+  }
+
+  function recenterView() {
+    if (!videoRoot) return;
+    const pose = headPose();
+    videoRoot.rotation.set(0, pose ? pose.yaw : 0, 0);
+    // y stays pinned to eye height: environmentRoot hangs below videoRoot at
+    // -EYE_HEIGHT, which is what keeps the auditorium floor on the real floor.
+    videoRoot.position.set(pose ? pose.position.x : 0, EYE_HEIGHT, pose ? pose.position.z : 0);
+    if (statusEl) statusEl.textContent = pose ? 'View recentred on your current head pose.' : 'View orientation reset.';
+    drawPanel();
+  }
+
   function resetAll() {
-    if (videoRoot) videoRoot.rotation.set(0, 0, 0);
+    recenterView();
     if (panelMesh) {
       panelMesh.position.set(PANEL_HOME.x, PANEL_HOME.y, PANEL_HOME.z);
       panelMesh.quaternion.identity();
       panelMesh.scale.set(1, 1, 1);
     }
     showPanel();
-    if (statusEl) statusEl.textContent = 'Control panel and view orientation reset.';
+    if (statusEl) statusEl.textContent = 'View recentred and control panel reset.';
     drawPanel();
   }
 
@@ -1922,6 +2011,57 @@
     statusEl.textContent = `Video source playback failed${code ? ` (MediaError ${code})` : ''}. Check the Jellyfin transcoding log.`;
   }
 
+  function currentQuality() {
+    return QUALITY_PRESETS.find((preset) => preset.id === qualityId) || QUALITY_PRESETS[0];
+  }
+
+  function readStoredQuality() {
+    try {
+      const value = localStorage.getItem(QUALITY_STORE_KEY);
+      return QUALITY_PRESETS.some((preset) => preset.id === value) ? value : 'max';
+    } catch (_) {
+      return 'max';
+    }
+  }
+
+  function rememberQuality() {
+    try { localStorage.setItem(QUALITY_STORE_KEY, qualityId); } catch (_) {}
+  }
+
+  // The cap is square rather than 16:9 on purpose. Jellyfin scales to fit the
+  // box while preserving aspect, and VR frames are routinely square (180 mono)
+  // or taller than wide (over-under), both of which a 3840x2160 box would
+  // shrink far harder than the tier name suggests.
+  function applyQualityParams(url) {
+    const quality = currentQuality();
+    setQueryParam(url, 'MaxWidth', String(quality.cap));
+    setQueryParam(url, 'MaxHeight', String(quality.cap));
+    setQueryParam(url, 'VideoBitRate', String(quality.bitrate));
+  }
+
+  // Quality only means something for our own transcode: in "original" mode the
+  // stream was negotiated by Jellyfin's player and is not ours to re-request,
+  // so choosing a quality also switches over to the compatibility source.
+  function applyQuality(id, remember = true) {
+    if (!QUALITY_PRESETS.some((preset) => preset.id === id)) return;
+    qualityId = id;
+    if (remember) rememberQuality();
+    updateToolbar();
+    drawPanel();
+    if (!compatUrl) {
+      if (statusEl) statusEl.textContent = 'Quality needs the H.264 compatibility source, which this stream URL cannot provide.';
+      return;
+    }
+    startCompatAt(getCurrentTime(), !activeVideo?.paused).catch((error) => {
+      if (statusEl) statusEl.textContent = `Quality change failed: ${error?.message || error}`;
+    });
+  }
+
+  function cycleQuality() {
+    const index = QUALITY_PRESETS.findIndex((preset) => preset.id === qualityId);
+    applyQuality(QUALITY_PRESETS[(index + 1) % QUALITY_PRESETS.length].id);
+  }
+
   async function startCompatAt(position, shouldPlay = true) {
     if (!compatUrl) throw new Error('Cannot derive a Jellyfin H.264 compatibility source from this URL');
     const serial = ++loadSerial;
@@ -1929,6 +2069,7 @@
     const target = Math.max(0, Math.min(Number(position) || 0, duration ? duration - 0.25 : Infinity));
     const url = new URL(compatUrl);
     setQueryParam(url, 'StartTimeTicks', Math.round(target * 10000000));
+    applyQualityParams(url);
     const previousSessionId = compatSessionId;
     compatSessionId = newCompatSessionId();
     setQueryParam(url, 'PlaySessionId', compatSessionId);
@@ -1958,7 +2099,7 @@
     overlay.appendChild(compatVideo);
     replaceVideoTexture(activeVideo);
     updateToolbar();
-    statusEl.textContent = `Starting H.264/8-bit transcode from ${formatTime(target)}...`;
+    statusEl.textContent = `Starting H.264/8-bit transcode (${currentQuality().label}) from ${formatTime(target)}...`;
     compatVideo.src = url.href;
     compatVideo.load();
     lastReportKey = '';
@@ -2044,6 +2185,8 @@
     else if (action === 'environment') cycleEnvironment();
     else if (action === 'swap') applyMode({ swap: !currentMode.swap }, true);
     else if (action === 'source') toggleSource();
+    else if (action === 'quality') cycleQuality();
+    else if (action === 'recenter') recenterView();
     else if (action === 'reset') resetAll();
     else if (action === 'hide') hidePanel();
     else if (action === 'exit-vr') exitVrOnly(true);
@@ -2066,6 +2209,12 @@
       sourceButton.textContent = sourceMode === 'compat' ? 'H.264 Compat ✓' : 'Original Source';
       sourceButton.classList.toggle('active', sourceMode === 'compat');
       sourceButton.disabled = !compatUrl;
+    }
+    const qualitySelect = overlay.querySelector('#jvr-quality-select');
+    if (qualitySelect) {
+      qualitySelect.value = qualityId;
+      qualitySelect.title = currentQuality().note;
+      qualitySelect.disabled = !compatUrl;
     }
   }
 
@@ -2114,6 +2263,11 @@
     else if (action === 'source') toggleSource();
   }
 
+  function handleToolbarChange(event) {
+    const select = event.target.closest('select[data-action="quality"]');
+    if (select) applyQuality(select.value);
+  }
+
   async function openPlayer() {
     if (overlay) return;
     sourceVideo = findVideo();
@@ -2127,6 +2281,7 @@
       itemText = '';
       detectionMessage = '';
       environmentName = readStoredEnvironment();
+      qualityId = readStoredQuality();
       detectionTimer = setTimeout(() => {
         itemTextReady = true;
         autoDetectMode();
