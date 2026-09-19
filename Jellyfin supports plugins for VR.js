@@ -21,10 +21,35 @@
   const ENV_STORE_KEY = 'jvr.env.v1';
   const ENVIRONMENTS = ['void', 'theater'];
   const EYE_HEIGHT = 1.6;
-  // Screen placement per environment, in videoRoot-local space (origin at eye height).
+  // Screen placement per environment, in videoRoot-local space (origin at eye
+  // height). `curveRatio` is the cylinder radius as a multiple of the viewing
+  // distance; 2.2 gives a sagitta of ~7% of the screen width, which is the
+  // gentle curve a commercial cinema screen actually has. 0 stays flat.
   const SCREEN_LAYOUTS = {
-    void: { height: 4.05, maxWidth: 9, distance: 4.5, centerY: 0 },
-    theater: { height: 6.75, maxWidth: 16, distance: 9.3, centerY: 1.3 }
+    void: { height: 4.05, maxWidth: 9, distance: 4.5, centerY: 0, curveRatio: 0 },
+    theater: { height: 8.8, maxWidth: 17, distance: 13.1, centerY: 0.12, curveRatio: 2.2 }
+  };
+  // Auditorium dimensions, in environment-local space: y = 0 is the tread the
+  // viewer stands on, the viewer is at the origin, and the screen is down -z.
+  const THEATER = {
+    rowDepth: 1.25,
+    riser: 0.42,
+    rowsFront: 8,
+    rowsBack: 4,
+    seatPitch: 0.58,
+    seatHalfSpan: 8.2,
+    aisleInner: 2.7,
+    aisleOuter: 4,
+    standingGap: 0.9,
+    // Seat rows arc around a point far behind the screen. The radius has to stay
+    // large enough that the outer seats of a row do not slide off their own
+    // tread: the offset grows as span^2 / 2r, and the tread is only rowDepth deep.
+    arcCenterZ: -110,
+    wallX: 9.8,
+    ceilingY: 8,
+    backWallZ: 7.8,
+    screenWallZ: -13.6,
+    stageHeight: 0.7
   };
 
   let overlay = null;
@@ -58,6 +83,7 @@
   let environmentRoot = null;
   let environmentBuilt = '';
   let screenSurround = null;
+  let environmentFog = null;
   let screenLayout = { width: 7.2, height: 4.05, y: 0, z: -4.5 };
   let controllers = [];
   let panelMesh = null;
@@ -538,7 +564,8 @@
       transparent: true,
       depthTest: false,
       depthWrite: false,
-      side: THREE.DoubleSide
+      side: THREE.DoubleSide,
+      fog: false
     });
     panelMesh = new THREE.Mesh(geometry, material);
     panelMesh.name = 'jvr-control-panel';
@@ -771,109 +798,550 @@
       width = preset.maxWidth;
       height = width / aspect;
     }
-    return { width, height, y: preset.centerY, z: -preset.distance };
+    return {
+      width,
+      height,
+      y: preset.centerY,
+      z: -preset.distance,
+      radius: preset.curveRatio ? preset.distance * preset.curveRatio : 0
+    };
+  }
+
+  function disposeMaterial(material) {
+    if (!material) return;
+    // Material.dispose() does not release the textures it references, and the
+    // room's textures are canvases we generated, so they have to go too. The
+    // video texture is shared and owned by closePlayer.
+    for (const key of ['map', 'alphaMap', 'emissiveMap']) {
+      if (material[key] && material[key] !== videoTexture) material[key].dispose();
+    }
+    material.dispose();
   }
 
   function disposeTree(root) {
     root?.traverse?.((object) => {
       if (object.isInstancedMesh) object.dispose();
       object.geometry?.dispose?.();
-      if (Array.isArray(object.material)) object.material.forEach((item) => item?.dispose?.());
-      else object.material?.dispose?.();
+      if (Array.isArray(object.material)) object.material.forEach(disposeMaterial);
+      else disposeMaterial(object.material);
     });
   }
 
-  function addSurface(group, width, height, color, position, rotation) {
-    const mesh = new THREE.Mesh(
-      new THREE.PlaneGeometry(width, height),
-      new THREE.MeshLambertMaterial({ color })
-    );
-    mesh.position.set(position[0], position[1], position[2]);
-    if (rotation) mesh.rotation.set(rotation[0], rotation[1], rotation[2]);
-    mesh.layers.set(0);
-    group.add(mesh);
-    return mesh;
+  // --- procedural textures -------------------------------------------------
+  // Everything is painted into a canvas at build time. The script has to stay a
+  // single pasteable file, so it cannot ship image assets, and a texture is what
+  // separates "grey boxes" from a room.
+
+  function makeTexture(width, height, draw, repeatX = 1, repeatY = 1) {
+    const canvas = document.createElement('canvas');
+    canvas.width = width;
+    canvas.height = height;
+    draw(canvas.getContext('2d'), width, height);
+    const texture = new THREE.CanvasTexture(canvas);
+    texture.colorSpace = THREE.SRGBColorSpace;
+    texture.wrapS = THREE.RepeatWrapping;
+    texture.wrapT = THREE.RepeatWrapping;
+    texture.repeat.set(repeatX, repeatY);
+    texture.anisotropy = Math.min(4, renderer?.capabilities?.getMaxAnisotropy?.() || 1);
+    return texture;
   }
 
-  // Authored with the floor at y = 0 and the viewer standing at the origin;
-  // `environmentRoot` sits at -EYE_HEIGHT inside videoRoot, so the floor lands
-  // under the user's feet. The floor steps down to a pit in front of the row so
-  // a screen taller than eye height can hang below eye level without clipping
-  // through the ground the user is standing on.
-  function buildTheater(group) {
-    const CARPET = 0x2b1f2c;
-    const RISER = 0x1a1219;
-    const WALL = 0x1b1f26;
-    const CEILING = 0x12151a;
-    const FRONT = 0x0b0d10;
-    const HALF_WIDTH = 9;
-    const BACK_Z = 7;
-    const FRONT_Z = -9.6;
-    const PIT_Z = -2;
-    const PIT_Y = -2.2;
-    const TOP_Y = 8;
-    const length = BACK_Z - FRONT_Z;
-    const wallHeight = TOP_Y - PIT_Y;
-    const midY = (TOP_Y + PIT_Y) / 2;
-    const midZ = (BACK_Z + FRONT_Z) / 2;
+  function carpetTexture(repeat) {
+    return makeTexture(128, 128, (context, size) => {
+      context.fillStyle = '#412534';
+      context.fillRect(0, 0, size, size);
+      for (let i = 0; i < 2800; i += 1) {
+        const shade = 34 + Math.random() * 62;
+        context.fillStyle = `rgba(${Math.round(shade * 1.7)},${Math.round(shade * 0.8)},${Math.round(shade)},0.55)`;
+        context.fillRect(Math.random() * size, Math.random() * size, 2, 2);
+      }
+      context.strokeStyle = 'rgba(196,96,120,0.26)';
+      context.lineWidth = 3;
+      for (const [cx, cy] of [[0, 0], [size, 0], [0, size], [size, size], [size / 2, size / 2]]) {
+        context.beginPath();
+        context.moveTo(cx, cy - 27);
+        context.lineTo(cx + 27, cy);
+        context.lineTo(cx, cy + 27);
+        context.lineTo(cx - 27, cy);
+        context.closePath();
+        context.stroke();
+      }
+    }, repeat, repeat);
+  }
 
-    addSurface(group, HALF_WIDTH * 2, BACK_Z - PIT_Z, CARPET, [0, 0, (BACK_Z + PIT_Z) / 2], [-Math.PI / 2, 0, 0]);
-    addSurface(group, HALF_WIDTH * 2, PIT_Z - FRONT_Z, CARPET, [0, PIT_Y, (PIT_Z + FRONT_Z) / 2], [-Math.PI / 2, 0, 0]);
-    addSurface(group, HALF_WIDTH * 2, -PIT_Y, RISER, [0, PIT_Y / 2, PIT_Z], null);
-    addSurface(group, HALF_WIDTH * 2, length, CEILING, [0, TOP_Y, midZ], [Math.PI / 2, 0, 0]);
-    addSurface(group, length, wallHeight, WALL, [-HALF_WIDTH, midY, midZ], [0, Math.PI / 2, 0]);
-    addSurface(group, length, wallHeight, WALL, [HALF_WIDTH, midY, midZ], [0, -Math.PI / 2, 0]);
-    addSurface(group, HALF_WIDTH * 2, wallHeight, FRONT, [0, midY, FRONT_Z], null);
-    addSurface(group, HALF_WIDTH * 2, wallHeight, WALL, [0, midY, BACK_Z], [0, Math.PI, 0]);
+  // Fabric-wrapped acoustic battens. The vertical zoning (skirting, field,
+  // upper band) is baked down the canvas and mapped once over the wall height,
+  // so only the horizontal rib rhythm repeats.
+  function wallPanelTexture(repeatX) {
+    return makeTexture(128, 512, (context, width, height) => {
+      const gradient = context.createLinearGradient(0, 0, 0, height);
+      gradient.addColorStop(0, '#262930');
+      gradient.addColorStop(0.16, '#3f4149');
+      gradient.addColorStop(0.78, '#3a3c44');
+      gradient.addColorStop(0.86, '#24262b');
+      gradient.addColorStop(1, '#1a1c20');
+      context.fillStyle = gradient;
+      context.fillRect(0, 0, width, height);
+      for (let rib = 0; rib < 4; rib += 1) {
+        const x = rib * 32;
+        context.fillStyle = 'rgba(0,0,0,0.45)';
+        context.fillRect(x, 0, 3, height);
+        context.fillStyle = 'rgba(255,255,255,0.055)';
+        context.fillRect(x + 3, 0, 2, height);
+      }
+      for (let i = 0; i < 6000; i += 1) {
+        context.fillStyle = `rgba(255,255,255,${Math.random() * 0.04})`;
+        context.fillRect(Math.random() * width, Math.random() * height, 1, 1);
+      }
+    }, repeatX, 1);
+  }
 
-    const rows = 5;
-    const perRow = 13;
-    const seatGeometry = new THREE.BoxGeometry(0.62, 0.92, 0.62);
-    seatGeometry.translate(0, 0.46, 0);
+  function curtainTexture(repeatX) {
+    return makeTexture(128, 256, (context, width, height) => {
+      for (let x = 0; x < width; x += 1) {
+        const fold = 0.5 + 0.5 * Math.cos((x / width) * Math.PI * 2 * 4);
+        const shade = 16 + fold * 58;
+        context.fillStyle = `rgb(${Math.round(shade * 2)},${Math.round(shade * 0.4)},${Math.round(shade * 0.6)})`;
+        context.fillRect(x, 0, 1, height);
+      }
+      const gradient = context.createLinearGradient(0, 0, 0, height);
+      gradient.addColorStop(0, 'rgba(0,0,0,0.35)');
+      gradient.addColorStop(0.35, 'rgba(0,0,0,0)');
+      gradient.addColorStop(1, 'rgba(0,0,0,0.6)');
+      context.fillStyle = gradient;
+      context.fillRect(0, 0, width, height);
+    }, repeatX, 1);
+  }
+
+  function glowTexture() {
+    return makeTexture(128, 128, (context, size) => {
+      const gradient = context.createRadialGradient(size / 2, size / 2, 0, size / 2, size / 2, size / 2);
+      gradient.addColorStop(0, 'rgba(255,255,255,1)');
+      gradient.addColorStop(0.3, 'rgba(255,255,255,0.4)');
+      gradient.addColorStop(1, 'rgba(255,255,255,0)');
+      context.fillStyle = gradient;
+      context.fillRect(0, 0, size, size);
+    });
+  }
+
+  // Soft rectangular falloff for the light the screen throws onto the front
+  // wall. A blurred rounded rect reads far better than a hard additive quad.
+  function bleedTexture(inset) {
+    return makeTexture(256, 256, (context, size) => {
+      context.clearRect(0, 0, size, size);
+      context.filter = 'blur(24px)';
+      context.fillStyle = 'rgba(255,255,255,0.9)';
+      roundedRect(context, size * inset, size * inset, size * (1 - inset * 2), size * (1 - inset * 2), 24);
+      context.fill();
+      context.filter = 'none';
+    });
+  }
+
+  function exitSignTexture() {
+    return makeTexture(128, 64, (context, width, height) => {
+      context.fillStyle = '#041008';
+      context.fillRect(0, 0, width, height);
+      context.fillStyle = '#1cff78';
+      context.fillRect(5, 5, width - 10, height - 10);
+      context.fillStyle = '#04210e';
+      context.font = 'bold 36px system-ui, sans-serif';
+      context.textAlign = 'center';
+      context.textBaseline = 'middle';
+      context.fillText('EXIT', width / 2, height / 2 + 2);
+    });
+  }
+
+  // --- geometry helpers ----------------------------------------------------
+
+  function paintGeometry(geometry, color) {
+    const count = geometry.attributes.position.count;
+    const array = new Float32Array(count * 3);
+    const value = new THREE.Color(color);
+    for (let index = 0; index < count; index += 1) {
+      array[index * 3] = value.r;
+      array[index * 3 + 1] = value.g;
+      array[index * 3 + 2] = value.b;
+    }
+    geometry.setAttribute('color', new THREE.BufferAttribute(array, 3));
+    return geometry;
+  }
+
+  // Three's BufferGeometryUtils lives under examples/, which a single pasteable
+  // file cannot import, so parts are merged by hand. Converting to non-indexed
+  // first reduces the merge to concatenating attribute arrays.
+  function mergeParts(parts) {
+    const expanded = parts.map((geometry) => (geometry.index ? geometry.toNonIndexed() : geometry));
+    const keys = ['position', 'normal', 'uv', 'color'].filter(
+      (key) => expanded.every((geometry) => geometry.attributes[key])
+    );
+    const merged = new THREE.BufferGeometry();
+    for (const key of keys) {
+      const itemSize = expanded[0].attributes[key].itemSize;
+      let total = 0;
+      for (const geometry of expanded) total += geometry.attributes[key].count * itemSize;
+      const array = new Float32Array(total);
+      let offset = 0;
+      for (const geometry of expanded) {
+        array.set(geometry.attributes[key].array, offset);
+        offset += geometry.attributes[key].count * itemSize;
+      }
+      merged.setAttribute(key, new THREE.BufferAttribute(array, itemSize));
+    }
+    expanded.forEach((geometry, index) => { if (geometry !== parts[index]) geometry.dispose(); });
+    parts.forEach((geometry) => geometry.dispose());
+    return merged;
+  }
+
+  // Bend a plane around a vertical cylinder of the given radius, keeping arc
+  // length (so the screen stays `width` metres of picture) and leaving UVs
+  // untouched, which is what lets the stereo UV baking run afterwards.
+  function bendAroundY(geometry, radius) {
+    if (!radius) return geometry;
+    const position = geometry.attributes.position;
+    for (let index = 0; index < position.count; index += 1) {
+      const theta = position.getX(index) / radius;
+      position.setXYZ(
+        index,
+        radius * Math.sin(theta),
+        position.getY(index),
+        position.getZ(index) + radius * (1 - Math.cos(theta))
+      );
+    }
+    position.needsUpdate = true;
+    geometry.computeVertexNormals();
+    return geometry;
+  }
+
+  // Box projection: pick the UV plane per vertex from the dominant normal axis,
+  // so one tiling scale holds across treads, risers and walls alike.
+  function boxProjectUV(geometry, scale) {
+    const position = geometry.attributes.position;
+    const normal = geometry.attributes.normal;
+    const uv = new Float32Array(position.count * 2);
+    for (let index = 0; index < position.count; index += 1) {
+      const nx = Math.abs(normal.getX(index));
+      const ny = Math.abs(normal.getY(index));
+      const nz = Math.abs(normal.getZ(index));
+      let u;
+      let v;
+      if (ny >= nx && ny >= nz) { u = position.getX(index); v = position.getZ(index); }
+      else if (nx >= nz) { u = position.getZ(index); v = position.getY(index); }
+      else { u = position.getX(index); v = position.getY(index); }
+      uv[index * 2] = u / scale;
+      uv[index * 2 + 1] = v / scale;
+    }
+    geometry.setAttribute('uv', new THREE.BufferAttribute(uv, 2));
+    return geometry;
+  }
+
+  function plane(width, height, position, rotation, segments = 1) {
+    const geometry = new THREE.PlaneGeometry(width, height, segments, 1);
+    if (rotation) {
+      if (rotation[0]) geometry.rotateX(rotation[0]);
+      if (rotation[1]) geometry.rotateY(rotation[1]);
+    }
+    geometry.translate(position[0], position[1], position[2]);
+    return geometry;
+  }
+
+  function box(width, height, depth, position, rotation) {
+    const geometry = new THREE.BoxGeometry(width, height, depth);
+    if (rotation) geometry.rotateX(rotation);
+    geometry.translate(position[0], position[1], position[2]);
+    return geometry;
+  }
+
+  function rowLevel(row) {
+    return { y: row * THEATER.riser, z: row * THEATER.rowDepth };
+  }
+
+  function floorExtent() {
+    const front = rowLevel(-THEATER.rowsFront);
+    const back = rowLevel(THEATER.rowsBack);
+    return {
+      lowY: front.y - THEATER.riser,
+      lowEdgeZ: front.z - THEATER.rowDepth / 2,
+      highY: back.y + THEATER.riser,
+      highEdgeZ: back.z + THEATER.rowDepth / 2
+    };
+  }
+
+  // --- auditorium ----------------------------------------------------------
+
+  // One cinema seat, origin at the floor between its feet, facing -z. Five boxes
+  // merged into a single vertex-coloured geometry so the whole house is one
+  // instanced draw call rather than one per seat part.
+  function makeSeatGeometry() {
+    const FRAME = 0x2b2733;
+    const FABRIC = 0x73202f;
+    return mergeParts([
+      paintGeometry(box(0.5, 0.4, 0.46, [0, 0.2, 0.02]), FRAME),
+      paintGeometry(box(0.5, 0.13, 0.46, [0, 0.455, 0], 0.09), FABRIC),
+      paintGeometry(box(0.52, 0.78, 0.14, [0, 0.88, 0.22], 0.2), FABRIC),
+      paintGeometry(box(0.08, 0.09, 0.44, [-0.29, 0.6, 0.04]), FRAME),
+      paintGeometry(box(0.08, 0.09, 0.44, [0.29, 0.6, 0.04]), FRAME)
+    ]);
+  }
+
+  function seatPlacements() {
+    const placements = [];
+    const count = Math.floor((THEATER.seatHalfSpan * 2) / THEATER.seatPitch);
+    for (let row = -THEATER.rowsFront; row <= THEATER.rowsBack; row += 1) {
+      const level = rowLevel(row);
+      const radius = level.z - THEATER.arcCenterZ;
+      for (let seat = 0; seat < count; seat += 1) {
+        const arc = (seat - (count - 1) / 2) * THEATER.seatPitch;
+        const distance = Math.abs(arc);
+        if (distance >= THEATER.aisleInner && distance <= THEATER.aisleOuter) continue;
+        // Leave the viewer's own spot clear; they are standing in it.
+        if (row === 0 && distance < THEATER.standingGap) continue;
+        const angle = arc / radius;
+        placements.push({
+          x: radius * Math.sin(angle),
+          y: level.y,
+          z: THEATER.arcCenterZ + radius * Math.cos(angle),
+          angle
+        });
+      }
+    }
+    return placements;
+  }
+
+  function buildSeating(group) {
+    const placements = seatPlacements();
     const seats = new THREE.InstancedMesh(
-      seatGeometry,
-      new THREE.MeshLambertMaterial({ color: 0x241c26 }),
-      rows * perRow
+      makeSeatGeometry(),
+      new THREE.MeshLambertMaterial({ vertexColors: true }),
+      placements.length
     );
     const matrix = new THREE.Matrix4();
-    let index = 0;
-    for (let row = 0; row < rows; row += 1) {
-      const stagger = row % 2 ? 0.37 : 0;
-      for (let seat = 0; seat < perRow; seat += 1) {
-        matrix.makeTranslation((seat - (perRow - 1) / 2) * 0.74 + stagger, PIT_Y, -7.4 + row * 1.12);
-        seats.setMatrixAt(index, matrix);
-        index += 1;
-      }
-    }
+    const position = new THREE.Vector3();
+    const quaternion = new THREE.Quaternion();
+    const scale = new THREE.Vector3(1, 1, 1);
+    const axis = new THREE.Vector3(0, 1, 0);
+    placements.forEach((placement, index) => {
+      position.set(placement.x, placement.y, placement.z);
+      quaternion.setFromAxisAngle(axis, placement.angle);
+      seats.setMatrixAt(index, matrix.compose(position, quaternion, scale));
+    });
     seats.instanceMatrix.needsUpdate = true;
+    // The bounding sphere of a single seat would cull the whole house.
+    seats.name = 'jvr-theater-seats';
+    seats.frustumCulled = false;
     seats.layers.set(0);
     group.add(seats);
-
-    const stripGeometry = new THREE.PlaneGeometry(0.2, 0.07);
-    const stripMaterial = new THREE.MeshBasicMaterial({ color: 0xff9a55, transparent: true, opacity: 0.8 });
-    for (let step = 0; step < 6; step += 1) {
-      for (const side of [-1, 1]) {
-        const strip = new THREE.Mesh(stripGeometry, stripMaterial);
-        strip.position.set(side * (HALF_WIDTH - 0.02), PIT_Y + 0.38, -8.8 + step * 1.25);
-        strip.rotation.y = side < 0 ? Math.PI / 2 : -Math.PI / 2;
-        strip.layers.set(0);
-        group.add(strip);
-      }
-    }
-
-    group.add(new THREE.AmbientLight(0x2b3442, 1.1));
-    // decay 0 turns off the inverse-square term, leaving a plain distance window
-    // that is far easier to tune than physical units for a room this size.
-    const screenGlow = new THREE.PointLight(0xa8ccf0, 2.2, 30, 0);
-    screenGlow.position.set(0, EYE_HEIGHT + SCREEN_LAYOUTS.theater.centerY, -8.6);
-    group.add(screenGlow);
-    const houseLight = new THREE.PointLight(0xff9a55, 0.45, 18, 0);
-    houseLight.position.set(0, TOP_Y - 1.2, 3);
-    group.add(houseLight);
   }
 
-  // The masking frame has to track the screen, whose width follows the video's
-  // aspect ratio, so it is rebuilt separately from the (static) room.
+  function buildFloor(group) {
+    const width = THEATER.wallX * 2;
+    const extent = floorExtent();
+    const parts = [];
+    for (let row = -THEATER.rowsFront; row <= THEATER.rowsBack; row += 1) {
+      const level = rowLevel(row);
+      parts.push(plane(width, THEATER.rowDepth, [0, level.y, level.z], [-Math.PI / 2, 0]));
+      // The riser at the screen-facing edge of a tread is only ever seen from
+      // further down the rake, so it faces -z.
+      parts.push(plane(width, THEATER.riser, [0, level.y - THEATER.riser / 2, level.z - THEATER.rowDepth / 2], [0, Math.PI]));
+    }
+    const frontDepth = extent.lowEdgeZ - THEATER.screenWallZ;
+    parts.push(plane(width, frontDepth, [0, extent.lowY, (extent.lowEdgeZ + THEATER.screenWallZ) / 2], [-Math.PI / 2, 0]));
+    const backDepth = THEATER.backWallZ - extent.highEdgeZ;
+    parts.push(plane(width, backDepth, [0, extent.highY, (extent.highEdgeZ + THEATER.backWallZ) / 2], [-Math.PI / 2, 0]));
+    parts.push(plane(width, THEATER.riser, [0, extent.highY - THEATER.riser / 2, extent.highEdgeZ], [0, Math.PI]));
+
+    const floor = new THREE.Mesh(
+      boxProjectUV(mergeParts(parts), 2),
+      new THREE.MeshLambertMaterial({ map: carpetTexture(1) })
+    );
+    floor.name = 'jvr-theater-floor';
+    floor.layers.set(0);
+    group.add(floor);
+  }
+
+  function buildShell(group) {
+    const extent = floorExtent();
+    const length = THEATER.backWallZ - THEATER.screenWallZ;
+    const height = THEATER.ceilingY - extent.lowY;
+    const midY = (THEATER.ceilingY + extent.lowY) / 2;
+    const midZ = (THEATER.backWallZ + THEATER.screenWallZ) / 2;
+
+    const sideMaterial = new THREE.MeshLambertMaterial({ map: wallPanelTexture(length / 2) });
+    for (const side of [-1, 1]) {
+      const wall = new THREE.Mesh(new THREE.PlaneGeometry(length, height), sideMaterial);
+      wall.position.set(side * THEATER.wallX, midY, midZ);
+      wall.rotation.y = side < 0 ? Math.PI / 2 : -Math.PI / 2;
+      wall.name = `jvr-theater-wall-${side < 0 ? 'left' : 'right'}`;
+      wall.layers.set(0);
+      group.add(wall);
+    }
+
+    const back = new THREE.Mesh(
+      new THREE.PlaneGeometry(THEATER.wallX * 2, height),
+      new THREE.MeshLambertMaterial({ map: wallPanelTexture(THEATER.wallX) })
+    );
+    back.position.set(0, midY, THEATER.backWallZ);
+    back.rotation.y = Math.PI;
+    back.name = 'jvr-theater-wall-back';
+    back.layers.set(0);
+    group.add(back);
+
+    // The wall the screen hangs on stays matte near-black so nothing competes
+    // with the picture.
+    const front = new THREE.Mesh(
+      new THREE.PlaneGeometry(THEATER.wallX * 2, height),
+      new THREE.MeshLambertMaterial({ color: 0x101217 })
+    );
+    front.position.set(0, midY, THEATER.screenWallZ);
+    front.name = 'jvr-theater-wall-front';
+    front.layers.set(0);
+    group.add(front);
+
+    const ceilingParts = [plane(THEATER.wallX * 2, length, [0, THEATER.ceilingY, midZ], [Math.PI / 2, 0])];
+    for (let beam = 0; beam < 6; beam += 1) {
+      const z = THEATER.screenWallZ + 2 + beam * ((length - 4) / 5);
+      ceilingParts.push(box(THEATER.wallX * 2, 0.3, 0.55, [0, THEATER.ceilingY - 0.15, z]));
+    }
+    const ceiling = new THREE.Mesh(
+      mergeParts(ceilingParts),
+      new THREE.MeshLambertMaterial({ color: 0x1b1e23 })
+    );
+    ceiling.name = 'jvr-theater-ceiling';
+    ceiling.layers.set(0);
+    group.add(ceiling);
+
+    // Stage apron under the screen, with the two screen-channel speaker stacks.
+    const stageTop = extent.lowY + THEATER.stageHeight;
+    const stageParts = [
+      plane(THEATER.wallX * 2, 2.4, [0, stageTop, THEATER.screenWallZ + 1.2], [-Math.PI / 2, 0]),
+      plane(THEATER.wallX * 2, THEATER.stageHeight, [0, stageTop - THEATER.stageHeight / 2, THEATER.screenWallZ + 2.4], [0, 0])
+    ];
+    for (const side of [-1, 1]) {
+      stageParts.push(box(0.75, 1.9, 0.6, [side * 6.6, stageTop + 0.95, THEATER.screenWallZ + 0.9]));
+    }
+    const stage = new THREE.Mesh(mergeParts(stageParts), new THREE.MeshLambertMaterial({ color: 0x16181d }));
+    stage.name = 'jvr-theater-stage';
+    stage.layers.set(0);
+    group.add(stage);
+  }
+
+  function buildFixtures(group) {
+    const extent = floorExtent();
+    const glow = glowTexture();
+    const glowMaterial = new THREE.MeshBasicMaterial({
+      map: glow,
+      color: 0xffb066,
+      transparent: true,
+      blending: THREE.AdditiveBlending,
+      depthWrite: false
+    });
+    const lampParts = [];
+    const housingParts = [];
+
+    // Wall sconces down both side walls.
+    for (let index = 0; index < 6; index += 1) {
+      const z = THEATER.screenWallZ + 3 + index * 3.2;
+      for (const side of [-1, 1]) {
+        const x = side * (THEATER.wallX - 0.08);
+        lampParts.push(plane(1.2, 1.8, [x, 2.2, z], [0, side < 0 ? Math.PI / 2 : -Math.PI / 2]));
+        housingParts.push(box(0.12, 0.62, 0.18, [side * (THEATER.wallX - 0.09), 2.2, z]));
+      }
+    }
+    // Aisle markers: a small glowing pad on the tread at each row end, which is
+    // what stays visible from a seat. Riser-mounted lights would face away.
+    for (let row = -THEATER.rowsFront; row <= THEATER.rowsBack; row += 1) {
+      const level = rowLevel(row);
+      for (const side of [-1, 1]) {
+        for (const edge of [THEATER.aisleInner, THEATER.aisleOuter]) {
+          lampParts.push(plane(0.34, 0.34, [side * edge, level.y + 0.012, level.z], [-Math.PI / 2, 0]));
+        }
+      }
+    }
+    const lamps = new THREE.Mesh(mergeParts(lampParts), glowMaterial);
+    lamps.name = 'jvr-theater-lamps';
+    lamps.layers.set(0);
+    lamps.renderOrder = 2;
+    group.add(lamps);
+    const housings = new THREE.Mesh(mergeParts(housingParts), new THREE.MeshLambertMaterial({ color: 0x1c1f26 }));
+    housings.name = 'jvr-theater-housings';
+    housings.layers.set(0);
+    group.add(housings);
+
+    // Ceiling downlights, dim enough to read as fixtures rather than lamps.
+    const downlights = new THREE.Mesh(
+      mergeParts(
+        [-4.5, 0, 4.5].flatMap((x) => [-9, -4.5, 0, 4.5].map(
+          (z) => plane(0.9, 0.9, [x, THEATER.ceilingY - 0.02, z], [Math.PI / 2, 0])
+        ))
+      ),
+      new THREE.MeshBasicMaterial({
+        map: glow.clone(),
+        color: 0xffc98a,
+        transparent: true,
+        opacity: 0.35,
+        blending: THREE.AdditiveBlending,
+        depthWrite: false
+      })
+    );
+    downlights.material.map.needsUpdate = true;
+    downlights.name = 'jvr-theater-downlights';
+    downlights.layers.set(0);
+    group.add(downlights);
+
+    // Exit signs: two at the back of the house, two down by the screen. Nothing
+    // says "cinema" faster than a green sign glowing in the dark.
+    const signMaterial = new THREE.MeshBasicMaterial({ map: exitSignTexture(), transparent: true });
+    const signs = [];
+    for (const side of [-1, 1]) {
+      signs.push(plane(0.86, 0.43, [side * (THEATER.wallX - 1.6), extent.highY + 2.3, THEATER.backWallZ - 0.06], [0, Math.PI]));
+      signs.push(plane(0.86, 0.43, [side * (THEATER.wallX - 0.07), extent.lowY + 2.3, THEATER.screenWallZ + 3.4], [0, side < 0 ? Math.PI / 2 : -Math.PI / 2]));
+    }
+    const signMesh = new THREE.Mesh(mergeParts(signs), signMaterial);
+    signMesh.name = 'jvr-theater-exit-signs';
+    signMesh.layers.set(0);
+    group.add(signMesh);
+
+    // Projection booth ports on the back wall.
+    const ports = new THREE.Mesh(
+      mergeParts([-1.1, 1.1].map((x) => plane(1.1, 0.8, [x, extent.highY + 3.4, THEATER.backWallZ - 0.05], [0, Math.PI]))),
+      new THREE.MeshBasicMaterial({ color: 0x0a1420 })
+    );
+    ports.name = 'jvr-theater-booth-ports';
+    ports.layers.set(0);
+    group.add(ports);
+  }
+
+  function buildTheaterLights(group) {
+    const extent = floorExtent();
+    const screenY = EYE_HEIGHT + SCREEN_LAYOUTS.theater.centerY;
+    // Ambient only keeps the far corners off pure black: a real auditorium is
+    // lit almost entirely by the screen, so the falloff has to come from the
+    // point lights, not from a uniform fill.
+    group.add(new THREE.AmbientLight(0x35435c, 1));
+    // decay 0 drops the inverse-square term and leaves a plain distance window,
+    // which is far easier to tune than physical candela for a room this size.
+    const key = new THREE.PointLight(0x9fc4ea, 3.4, 19, 0);
+    key.position.set(0, screenY, THEATER.screenWallZ + 2.4);
+    group.add(key);
+    // Bounce off the stage, so the front rows are not lit from nowhere.
+    const bounce = new THREE.PointLight(0x7f9ec4, 1.2, 16, 0);
+    bounce.position.set(0, extent.lowY + 1.4, THEATER.screenWallZ + 4.2);
+    group.add(bounce);
+    const house = new THREE.PointLight(0xffa864, 1.4, 17, 0);
+    house.position.set(0, extent.highY + 2.6, THEATER.backWallZ - 2);
+    group.add(house);
+  }
+
+  function buildTheater(group) {
+    buildFloor(group);
+    buildShell(group);
+    buildSeating(group);
+    buildFixtures(group);
+    buildTheaterLights(group);
+  }
+
+  // Masking, drapes and the screen wash all track the screen, whose width
+  // follows the video's aspect ratio, so they are rebuilt separately from the
+  // room itself.
   function buildScreenSurround() {
     if (screenSurround) {
       screenSurround.parent?.remove(screenSurround);
@@ -881,37 +1349,95 @@
       screenSurround = null;
     }
     if (!environmentRoot || !environmentActive()) return;
-    const { width, height, y, z } = screenLayout;
+    const { width, height, y, z, radius } = screenLayout;
     const centerY = y + EYE_HEIGHT;
     const group = new THREE.Group();
     group.name = 'jvr-screen-surround';
-    const thickness = 0.32;
-    const maskMaterial = new THREE.MeshBasicMaterial({ color: 0x050607 });
-    const pieces = [
-      [width + thickness * 2, thickness, 0, height / 2 + thickness / 2],
-      [width + thickness * 2, thickness, 0, -height / 2 - thickness / 2],
-      [thickness, height, -width / 2 - thickness / 2, 0],
-      [thickness, height, width / 2 + thickness / 2, 0]
-    ];
-    for (const [pieceWidth, pieceHeight, offsetX, offsetY] of pieces) {
-      const piece = new THREE.Mesh(new THREE.PlaneGeometry(pieceWidth, pieceHeight), maskMaterial);
-      piece.position.set(offsetX, centerY + offsetY, z - 0.05);
-      piece.layers.set(0);
-      group.add(piece);
+
+    // Black velvet masking, curved to sit just behind the screen. A bend only
+    // moves vertices, so a single-quad strip would cut the curve as a flat
+    // chord and the picture would bulge a metre through its own frame.
+    const border = 0.45;
+    const arcSegments = (span) => (radius ? Math.max(1, Math.round(span / 0.4)) : 1);
+    const mask = mergeParts([
+      plane(width + border * 2, border, [0, centerY + height / 2 + border / 2, z - 0.06], null, arcSegments(width)),
+      plane(width + border * 2, border, [0, centerY - height / 2 - border / 2, z - 0.06], null, arcSegments(width)),
+      plane(border, height, [-width / 2 - border / 2, centerY, z - 0.06], null, arcSegments(border)),
+      plane(border, height, [width / 2 + border / 2, centerY, z - 0.06], null, arcSegments(border))
+    ]);
+    const maskMesh = new THREE.Mesh(bendAroundY(mask, radius), new THREE.MeshBasicMaterial({ color: 0x040507 }));
+    maskMesh.name = 'jvr-screen-mask';
+    maskMesh.layers.set(0);
+    group.add(maskMesh);
+
+    // Pleated drapes flanking the masking, running down to the stage.
+    const extent = floorExtent();
+    const drapeTop = centerY + height / 2 + border;
+    const drapeBottom = extent.lowY + THEATER.stageHeight;
+    const drapeHeight = drapeTop - drapeBottom;
+    const drapeWidth = Math.max(0.8, THEATER.wallX - 0.6 - (width / 2 + border));
+    if (drapeHeight > 0.5) {
+      const drapes = mergeParts([-1, 1].map((side) => plane(
+        drapeWidth,
+        drapeHeight,
+        [side * (width / 2 + border + drapeWidth / 2), drapeBottom + drapeHeight / 2, z - 0.12],
+        null,
+        arcSegments(drapeWidth)
+      )));
+      const drapeMesh = new THREE.Mesh(
+        bendAroundY(drapes, radius),
+        new THREE.MeshLambertMaterial({ map: curtainTexture(Math.max(1, Math.round(drapeWidth * 1.6))) })
+      );
+      drapeMesh.name = 'jvr-screen-drapes';
+      drapeMesh.layers.set(0);
+      group.add(drapeMesh);
     }
+
+    // Proscenium soffit above the masking.
+    const soffitY = drapeTop + 0.55;
+    if (soffitY + 0.5 < THEATER.ceilingY) {
+      const soffit = new THREE.Mesh(
+        box(THEATER.wallX * 2, 1.1, 0.9, [0, soffitY, z - 0.4]),
+        new THREE.MeshLambertMaterial({ color: 0x131519 })
+      );
+      soffit.name = 'jvr-screen-soffit';
+      soffit.layers.set(0);
+      group.add(soffit);
+    }
+
+    // The wash the picture throws onto the wall around it. The halo is as wide
+    // as the space actually left around the masking — walls, ceiling and stage
+    // all crowd it, and a fixed multiple of the screen would punch through them.
+    const outerHalfWidth = width / 2 + border;
+    const outerHalfHeight = height / 2 + border;
+    const halo = THREE.MathUtils.clamp(
+      Math.min(
+        THEATER.wallX - 0.3 - outerHalfWidth,
+        THEATER.ceilingY - 0.25 - (centerY + outerHalfHeight),
+        centerY - outerHalfHeight - (extent.lowY + 0.05)
+      ),
+      0.3,
+      2
+    );
     const bleed = new THREE.Mesh(
-      new THREE.PlaneGeometry(width + 3.2, height + 2.4),
+      bendAroundY(
+        new THREE.PlaneGeometry((outerHalfWidth + halo) * 2, (outerHalfHeight + halo) * 2, radius ? 32 : 1, 1),
+        radius
+      ),
       new THREE.MeshBasicMaterial({
-        color: 0x3f7ea6,
+        map: bleedTexture(halo / ((outerHalfWidth + halo) * 2)),
+        color: 0x5f9ec8,
         transparent: true,
-        opacity: 0.22,
+        opacity: 0.36,
         blending: THREE.AdditiveBlending,
         depthWrite: false
       })
     );
-    bleed.position.set(0, centerY, z - 0.18);
+    bleed.position.set(0, centerY, z - 0.2);
+    bleed.name = 'jvr-screen-bleed';
     bleed.layers.set(0);
     group.add(bleed);
+
     environmentRoot.add(group);
     screenSurround = group;
   }
@@ -932,9 +1458,15 @@
 
   function syncEnvironment() {
     if (!environmentRoot) return;
+    const active = environmentActive();
     buildEnvironment();
     buildScreenSurround();
-    environmentRoot.visible = environmentActive();
+    environmentRoot.visible = active;
+    // Haze gives a big dark room its depth. It has to come off with the room:
+    // the 180/360 sphere sits at radius 50 and would be fogged into a flat wash.
+    // The screen and the panel opt out via `fog: false` on their own materials.
+    if (active && !environmentFog) environmentFog = new THREE.FogExp2(0x05060a, 0.016);
+    if (world) world.fog = active ? environmentFog : null;
     // A room has a horizon; keep it level even if the view was pitched earlier.
     if (environmentActive() && videoRoot) videoRoot.rotation.x = 0;
   }
@@ -962,7 +1494,8 @@
       geometry = new THREE.SphereGeometry(50, 64, 32, 0, Math.PI * 2, 0, Math.PI);
       geometry.scale(-1, 1, 1);
     } else if (projection === 'flat') {
-      geometry = new THREE.PlaneGeometry(screenLayout.width, screenLayout.height, 1, 1);
+      geometry = new THREE.PlaneGeometry(screenLayout.width, screenLayout.height, screenLayout.radius ? 48 : 1, 1);
+      bendAroundY(geometry, screenLayout.radius);
     } else {
       geometry = new THREE.SphereGeometry(50, 64, 32, -Math.PI / 2, Math.PI, 0, Math.PI);
       geometry.scale(-1, 1, 1);
@@ -987,7 +1520,8 @@
       return new THREE.MeshBasicMaterial({
         map: videoTexture,
         side: currentMode.projection === 'flat' ? THREE.DoubleSide : THREE.FrontSide,
-        toneMapped: false
+        toneMapped: false,
+        fog: false
       });
     }
     const selectedEye = currentMode.swap ? 1 - eye : eye;
@@ -1700,6 +2234,7 @@
     environmentRoot = null;
     environmentBuilt = '';
     screenSurround = null;
+    environmentFog = null;
     controllers = [];
     panelMesh = null;
     panelCanvas = null;
