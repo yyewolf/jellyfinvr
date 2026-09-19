@@ -15,6 +15,9 @@
   const PANEL_HOME = { x: 0, y: -0.13, z: -1.32 };
   const TIMELINE = { x: 80, y: 164, width: 1440, height: 76, trackY: 192, trackHeight: 20 };
   const PROGRESS_INTERVAL = 10000;
+  const MODE_STORE_KEY = 'jvr.modes.v1';
+  const MODE_STORE_LIMIT = 200;
+  const METADATA_TIMEOUT = 2500;
 
   let overlay = null;
   let statusEl = null;
@@ -31,6 +34,11 @@
   let compatSessionId = '';
   let progressTimer = 0;
   let lastReportKey = '';
+  let itemText = '';
+  let itemTextReady = false;
+  let detectionDone = false;
+  let detectionTimer = 0;
+  let detectionMessage = '';
 
   let world = null;
   let camera = null;
@@ -222,6 +230,182 @@
   function stopCompatEncoding() {
     stopEncoding(compatSessionId);
     compatSessionId = '';
+  }
+
+  // ---------------------------------------------------------------------
+  // Mode auto-detection
+  //
+  // Priority: a mode the user saved for this item > markers in the item name
+  // or file path > aspect-ratio heuristics. Name markers have to win, because
+  // half-SBS and half-OU are squeezed back into an ordinary 16:9 frame and are
+  // therefore indistinguishable from a 2D video by aspect alone.
+  // ---------------------------------------------------------------------
+
+  const PROJECTION_TOKENS = {
+    '360': '360', vr360: '360', '360vr': '360', '360x180': '360',
+    '180': '180', vr180: '180', '180vr': '180', '180x180': '180',
+    fisheye: 'fisheye',
+    flat: 'flat', '2d': 'flat'
+  };
+  const STEREO_TOKENS = {
+    sbs: 'sbs', hsbs: 'sbs', fsbs: 'sbs', '3dsbs': 'sbs', lr: 'sbs',
+    ou: 'ou', hou: 'ou', tb: 'ou', htb: 'ou', tab: 'ou',
+    mono: 'mono', '2d': 'mono'
+  };
+  // Lens profiles imply a fisheye projection: MKX200, MKX220, RF52, VRCA220...
+  const LENS_TOKEN = /^(?:mkx|rf|vrca|fisheye)\d+$/;
+
+  function tokenize(text) {
+    return String(text || '')
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, ' ')
+      .trim()
+      .split(' ')
+      .filter(Boolean);
+  }
+
+  // Packing markers show up glued to qualifiers: HalfOU, FullSBS, SBS3D, 3DTB.
+  function stereoFromToken(token) {
+    if (STEREO_TOKENS[token]) return STEREO_TOKENS[token];
+    const stripped = token.replace(/^(?:half|full|3d)/, '').replace(/3d$/, '');
+    return stripped && stripped !== token ? STEREO_TOKENS[stripped] || '' : '';
+  }
+
+  function detectFromText(text) {
+    const result = { projection: '', stereo: '', swap: false, stereoHint: false };
+    for (const token of tokenize(text)) {
+      if (!result.projection && PROJECTION_TOKENS[token]) result.projection = PROJECTION_TOKENS[token];
+      if (!result.projection && LENS_TOKEN.test(token)) result.projection = 'fisheye';
+      if (!result.stereo) result.stereo = stereoFromToken(token);
+      if (token === 'rl') { result.stereo = result.stereo || 'sbs'; result.swap = true; }
+      if (/^3d$/.test(token) || /3d$/.test(token) || /^3d/.test(token)) result.stereoHint = true;
+    }
+    return result;
+  }
+
+  function detectFromAspect(width, height) {
+    if (!width || !height) return {};
+    const ratio = width / height;
+    const near = (target, tolerance) => Math.abs(ratio - target) <= tolerance;
+    // VR panoramas are wide *and* large; gate on width so that a 2.00:1 or
+    // 2.35:1 cinema scope master is not mistaken for 180 side-by-side.
+    if (near(4, 0.2) && width >= 3000) return { projection: '360', stereo: 'sbs' };
+    if (near(3.56, 0.2)) return { projection: 'flat', stereo: 'sbs' };
+    if (near(2, 0.12) && width >= 3000) return { projection: '180', stereo: 'sbs' };
+    if (near(1, 0.1) && width >= 2000) return { projection: '180', stereo: 'mono' };
+    if (near(0.5, 0.06)) return { projection: '180', stereo: 'ou' };
+    if (near(0.89, 0.06)) return { projection: 'flat', stereo: 'ou' };
+    if (ratio >= 1.6 && ratio <= 2.45) return { projection: 'flat', stereo: 'mono' };
+    return {};
+  }
+
+  function resolveMode(text, width, height) {
+    const fromText = detectFromText(text);
+    const fromAspect = detectFromAspect(width, height);
+    const projection = fromText.projection || fromAspect.projection;
+    // A bare "3D" marker says there are two eyes but not how they are packed;
+    // side-by-side is by far the more common packing. It has to outrank an
+    // aspect-derived "mono", because half-SBS and half-OU are squeezed back
+    // into an ordinary 16:9 frame where the aspect ratio sees only one eye.
+    let stereo = fromText.stereo || fromAspect.stereo || '';
+    if (!fromText.stereo && fromText.stereoHint && (!stereo || stereo === 'mono')) stereo = 'sbs';
+    if (!projection && !stereo) return null;
+    const source = fromText.projection || fromText.stereo || fromText.stereoHint ? 'name' : 'resolution';
+    return {
+      projection: projection || (stereo && stereo !== 'mono' ? '180' : 'flat'),
+      stereo: stereo || 'mono',
+      swap: fromText.swap,
+      source
+    };
+  }
+
+  function readStoredModes() {
+    try {
+      return JSON.parse(localStorage.getItem(MODE_STORE_KEY)) || {};
+    } catch (_) {
+      return {};
+    }
+  }
+
+  function rememberMode() {
+    if (!jellyfin?.itemId) return;
+    try {
+      const store = readStoredModes();
+      delete store[jellyfin.itemId];
+      store[jellyfin.itemId] = {
+        projection: currentMode.projection,
+        stereo: currentMode.stereo,
+        swap: currentMode.swap
+      };
+      const keys = Object.keys(store);
+      for (const key of keys.slice(0, Math.max(0, keys.length - MODE_STORE_LIMIT))) delete store[key];
+      localStorage.setItem(MODE_STORE_KEY, JSON.stringify(store));
+    } catch (_) {}
+  }
+
+  function applyMode(changes, remember) {
+    Object.assign(currentMode, changes);
+    rebuildVideoMeshes();
+    if (remember) rememberMode();
+  }
+
+  function autoDetectMode() {
+    if (detectionDone || !itemTextReady) return;
+    const width = sourceVideo?.videoWidth || activeVideo?.videoWidth || 0;
+    const height = sourceVideo?.videoHeight || activeVideo?.videoHeight || 0;
+    if (!width || !height) return;
+    detectionDone = true;
+    if (detectionTimer) { clearTimeout(detectionTimer); detectionTimer = 0; }
+
+    const stored = jellyfin?.itemId ? readStoredModes()[jellyfin.itemId] : null;
+    if (stored?.projection && stored?.stereo) {
+      applyMode({ projection: stored.projection, stereo: stored.stereo, swap: Boolean(stored.swap) }, false);
+      detectionMessage = `saved mode ${stored.projection.toUpperCase()} / ${stored.stereo.toUpperCase()}`;
+    } else {
+      const detected = resolveMode(itemText, width, height);
+      if (!detected) return;
+      applyMode({ projection: detected.projection, stereo: detected.stereo, swap: detected.swap }, false);
+      detectionMessage = `detected ${detected.projection.toUpperCase()} / ${detected.stereo.toUpperCase()} from ${detected.source === 'name' ? 'the file name' : 'the resolution'}`;
+    }
+    if (statusEl) statusEl.textContent = `Mode: ${detectionMessage}`;
+  }
+
+  async function jellyfinGetJson(path) {
+    if (!jellyfin?.apiKey) return null;
+    try {
+      const response = await fetch(`${jellyfin.base}${path}`, { headers: { 'X-Emby-Token': jellyfin.apiKey } });
+      if (!response.ok) return null;
+      return await response.json();
+    } catch (_) {
+      return null;
+    }
+  }
+
+  // The stream URL carries no file name, so the markers detection needs live
+  // in the item record. Endpoint shape moved across Jellyfin versions, so try
+  // the user-scoped route first and fall back to the flat one.
+  async function loadItemText() {
+    itemText = document.title || '';
+    if (jellyfin?.itemId) {
+      let userId = '';
+      try { userId = window.ApiClient?.getCurrentUserId?.() || ''; } catch (_) {}
+      const routes = [];
+      if (userId) routes.push(`/Users/${userId}/Items/${jellyfin.itemId}`);
+      routes.push(`/Items/${jellyfin.itemId}`);
+      for (const route of routes) {
+        const item = await jellyfinGetJson(route);
+        if (!item) continue;
+        const sources = Array.isArray(item.MediaSources) ? item.MediaSources : [];
+        const parts = [item.Name, item.OriginalTitle, item.Path]
+          .concat(sources.map((source) => source.Name))
+          .concat(sources.map((source) => source.Path))
+          .filter(Boolean);
+        if (parts.length) itemText = parts.join(' ');
+        break;
+      }
+    }
+    itemTextReady = true;
+    autoDetectMode();
   }
 
   function buildCompatStreamUrl(video) {
@@ -922,6 +1106,7 @@
   function handleMediaReady() {
     if (this !== activeVideo) return;
     replaceVideoTexture(activeVideo);
+    autoDetectMode();
     const label = sourceMode === 'compat' ? 'H.264/8-bit compatibility source' : 'Original source';
     statusEl.textContent = `${label} connected · ${activeVideo.videoWidth || '?'}×${activeVideo.videoHeight || '?'} · ready to enter VR`;
     drawPanel();
@@ -1036,14 +1221,12 @@
 
   function cycleProjection() {
     const values = ['360', '180', 'fisheye', 'flat'];
-    currentMode.projection = values[(values.indexOf(currentMode.projection) + 1) % values.length];
-    rebuildVideoMeshes();
+    applyMode({ projection: values[(values.indexOf(currentMode.projection) + 1) % values.length] }, true);
   }
 
   function cycleStereo() {
     const values = ['mono', 'sbs', 'ou'];
-    currentMode.stereo = values[(values.indexOf(currentMode.stereo) + 1) % values.length];
-    rebuildVideoMeshes();
+    applyMode({ stereo: values[(values.indexOf(currentMode.stereo) + 1) % values.length] }, true);
   }
 
   function runAction(action) {
@@ -1054,7 +1237,7 @@
     else if (action === 'mute') activeVideo.muted = !activeVideo.muted;
     else if (action === 'projection') cycleProjection();
     else if (action === 'stereo') cycleStereo();
-    else if (action === 'swap') { currentMode.swap = !currentMode.swap; rebuildVideoMeshes(); }
+    else if (action === 'swap') applyMode({ swap: !currentMode.swap }, true);
     else if (action === 'source') toggleSource();
     else if (action === 'reset') resetAll();
     else if (action === 'hide') hidePanel();
@@ -1116,9 +1299,9 @@
     const { action, value } = button.dataset;
     if (action === 'exit') closePlayer();
     else if (action === 'enter') enterVr();
-    else if (action === 'projection') { currentMode.projection = value; rebuildVideoMeshes(); }
-    else if (action === 'stereo') { currentMode.stereo = value; rebuildVideoMeshes(); }
-    else if (action === 'swap') { currentMode.swap = !currentMode.swap; rebuildVideoMeshes(); }
+    else if (action === 'projection') applyMode({ projection: value }, true);
+    else if (action === 'stereo') applyMode({ stereo: value }, true);
+    else if (action === 'swap') applyMode({ swap: !currentMode.swap }, true);
     else if (action === 'source') toggleSource();
   }
 
@@ -1130,6 +1313,15 @@
       activeVideo = sourceVideo;
       jellyfin = readJellyfinContext(sourceVideo);
       compatUrl = buildCompatStreamUrl(sourceVideo);
+      detectionDone = false;
+      itemTextReady = false;
+      itemText = '';
+      detectionMessage = '';
+      detectionTimer = setTimeout(() => {
+        itemTextReady = true;
+        autoDetectMode();
+      }, METADATA_TIMEOUT);
+      loadItemText();
       originalState = {
         currentTime: sourceVideo.currentTime || 0,
         duration: sourceVideo.duration || 0,
@@ -1145,7 +1337,7 @@
       bindMediaEvents(sourceVideo, true);
       replaceVideoTexture(sourceVideo);
       updateToolbar();
-      statusEl.textContent = `Native WebXR ready · original source ${sourceVideo.videoWidth || '?'}×${sourceVideo.videoHeight || '?'}`;
+      statusEl.textContent = `Native WebXR ready · ${sourceVideo.videoWidth || '?'}×${sourceVideo.videoHeight || '?'}${detectionMessage ? ` · ${detectionMessage}` : ''}`;
       sourceVideo.play().catch(() => {});
     } catch (error) {
       closePlayer();
@@ -1219,6 +1411,12 @@
     savedVideoId = '';
     jellyfin = null;
     lastReportKey = '';
+    if (detectionTimer) clearTimeout(detectionTimer);
+    detectionTimer = 0;
+    detectionDone = false;
+    itemTextReady = false;
+    itemText = '';
+    detectionMessage = '';
     world = null;
     camera = null;
     renderer = null;
