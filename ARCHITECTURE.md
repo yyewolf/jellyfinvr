@@ -7,7 +7,7 @@ All line references point at `Jellyfin supports plugins for VR.js`.
 
 | Path | Role |
 | --- | --- |
-| `Jellyfin supports plugins for VR.js` | The entire product. ~1490 lines, one IIFE, no build step, no imports. |
+| `Jellyfin supports plugins for VR.js` | The entire product. ~1770 lines, one IIFE, no build step, no imports. |
 | `ARCHITECTURE.md` | This file. |
 | `README.md` | Bilingual EN/中文 install guide. |
 | `LICENSE` | GPL-3.0. |
@@ -19,36 +19,38 @@ runtime dependency is Three.js **r160.1**, fetched from jsDelivr at first use
 runs in Jellyfin Web's page context.
 
 Naming is still inconsistent and worth unifying: the file header says `v1`, the
-re-entry guard is `__JELLYFIN_VR_V42__` (line 7), the toolbar renders
+re-entry guard is `__JELLYFIN_VR_V42__` (line 8), the toolbar renders
 `Jellyfin VR v4.2`, and the README tells users to install a file called
 `jellyfin-vr-player-v2.js` that does not exist here.
 
 ## 2. Lifecycle
 
 ```
-init (1480)                     DOMContentLoaded
-  └─ scan (1474)                MutationObserver on <html> subtree + 1s interval
-       └─ addVrButton (1454)    injects "VR" button next to Jellyfin's fullscreen button
-            └─ openPlayer (1308) ← click
-                 ├─ findVideo (103)              pick Jellyfin's <video>
-                 ├─ readJellyfinContext (134)    derive API credentials from the stream URL
-                 ├─ buildCompatStreamUrl (411)   precompute H.264 fallback URL
-                 ├─ loadItemText (387)           fetch item name/path for mode detection
-                 ├─ ensureThree (98)             lazy-load Three.js from CDN
-                 ├─ buildOverlay (481)           full-screen DOM overlay + 2D toolbar
-                 ├─ buildRenderer (669)          scene, camera, WebGLRenderer, xr.enabled
-                 │    ├─ createPanel (513)       canvas-textured in-VR control panel
-                 │    └─ setupControllers (804)  2 controllers, laser beams, event wiring
-                 ├─ bindMediaEvents (1078)
-                 └─ replaceVideoTexture (782) → rebuildVideoMeshes (758)
+init (1757)                     DOMContentLoaded
+  └─ scan (1751)                MutationObserver on <html> subtree + 1s interval
+       └─ addVrButton (1731)    injects "VR" button next to Jellyfin's fullscreen button
+            └─ openPlayer (1577) ← click
+                 ├─ findVideo (116)              pick Jellyfin's <video>
+                 ├─ readJellyfinContext (147)    derive API credentials from the stream URL
+                 ├─ buildCompatStreamUrl (424)   precompute H.264 fallback URL
+                 ├─ loadItemText (400)           fetch item name/path for mode detection
+                 ├─ ensureThree (111)             lazy-load Three.js from CDN
+                 ├─ buildOverlay (494)           full-screen DOM overlay + 2D toolbar
+                 ├─ buildRenderer (685)          scene, camera, WebGLRenderer, xr.enabled
+                 │    ├─ environmentRoot        empty group for the room (section 4)
+                 │    ├─ createPanel (528)       canvas-textured in-VR control panel
+                 │    └─ setupControllers (1066)  2 controllers, laser beams, event wiring
+                 ├─ bindMediaEvents (1342)
+                 └─ replaceVideoTexture (1044) → rebuildVideoMeshes (1016)
+                                              └─ syncEnvironment (933) builds/shows the room
                                               ↓
-                 autoDetectMode (352)         fires once dimensions + metadata are known
+                 autoDetectMode (365)         fires once dimensions + metadata are known
                                               ↓
-                 enterVr (1264) ← "Enter VR" click → navigator.xr.requestSession
+                 enterVr (1532) ← "Enter VR" click → navigator.xr.requestSession
                                               ↓
-                 renderFrame (1065)           setAnimationLoop, runs every XR frame
+                 renderFrame (1329)           setAnimationLoop, runs every XR frame
                                               ↓
-                 closePlayer (1348)           tears everything down, restores <video>
+                 closePlayer (1618)           tears everything down, restores <video>
 ```
 
 `openPlayer` never replaces Jellyfin's player. It leaves the original `<video>`
@@ -60,29 +62,31 @@ on top of it. That is why library, metadata and watch-history behaviour survive
 
 This is the core feature set, and it is built from three cooperating pieces.
 
-**3.1 Mode state** — `currentMode` (line 81):
+**3.1 Mode state** — `currentMode` (line 94):
 
 ```js
 { projection: '180' | '360' | 'fisheye' | 'flat', stereo: 'mono' | 'sbs' | 'ou', swap: bool }
 ```
 
-Every mutation goes through `applyMode(changes, remember)` (line 346), which
+Every mutation goes through `applyMode(changes, remember)` (line 359), which
 assigns, rebuilds the meshes, and optionally persists the choice. User-driven
 call sites pass `remember: true`; auto-detection passes `false`, so a detection
 bug can never be frozen into storage as though the user had chosen it.
 
-**3.2 Geometry per eye** — `makeGeometry(projection, eye)` (line 701):
+**3.2 Geometry per eye** — `makeGeometry(projection, eye)` (line 959):
 
 - `360` → inverted sphere, full 2π sweep, radius 50.
 - `180` → inverted half-sphere (`-π/2` start, π length), rotated `y = π/2` when placed.
-- `flat` → 7.2 × 4.05 plane at `z = -4.5`. **This is the 3D-movie / cinema mode.**
+- `flat` → plane sized and placed by `computeScreenLayout` (line 765). **This is
+  the 3D-movie / cinema mode**, and the surface an environment is built around;
+  see section 4.
 - `fisheye` → same half-sphere as `180`, but the stereo split moves into a shader.
 
 For `sbs`/`ou`, the stereo split is **baked into the UV attribute** of the
 geometry, per eye: `sbs` maps `u → u*0.5 + eye*0.5`, `ou` maps
 `v → v*0.5 + (eye===0 ? 0.5 : 0)` (top half = left eye). `swap` inverts the eye
 index before the mapping. Consequence: **any mode change forces a full geometry
-rebuild** via `rebuildVideoMeshes` (line 758).
+rebuild** via `rebuildVideoMeshes` (line 1016).
 
 **3.3 Eye separation via Three.js layers** — this is the load-bearing trick:
 
@@ -93,13 +97,13 @@ rebuild** via `rebuildVideoMeshes` (line 758).
 | right-eye video | 2 |
 | everything else (panel, rays) | 0 |
 
-`configureEyeLayers` (line 793) runs every frame, grabs `renderer.xr.getCamera()`,
+`configureEyeLayers` (line 1055) runs every frame, grabs `renderer.xr.getCamera()`,
 and for each of the two XR eye cameras does `disableAll()` then enables layer 0
 plus layer 1 (left) or 2 (right). The desktop preview camera enables 0 and 1, so
 a non-VR preview shows the left eye only.
 
 `fisheye` is the exception: it skips UV baking and uses a `ShaderMaterial`
-(line 727) that maps `vLocal.xy * 0.5 + 0.5` and applies the stereo offset in
+(line 999) that maps `vLocal.xy * 0.5 + 0.5` and applies the stereo offset in
 the fragment shader. It has no FOV parameter, so 180°/190°/200° (MKX200, RF52)
 content is not correctly undistorted — a known gap.
 
@@ -108,21 +112,117 @@ virtual screen. Keep `makeGeometry`'s `flat` branch, the layer assignment in
 `rebuildVideoMeshes`, and `configureEyeLayers` intact through any refactor —
 those three together *are* the 3D feature.
 
-## 4. Mode auto-detection
+## 4. Environments (cinema rooms)
 
-`resolveMode` (line 302) picks a projection/stereo pair from three tiers, highest
+An *environment* is 3D room geometry placed around the `flat` screen. It is
+orthogonal to `currentMode`: a separate state slot, `environmentName`, one of
+`'void' | 'theater'`, persisted **globally** in `localStorage` under
+`jvr.env.v1`. That is deliberately not per-item the way projection is — the room
+you want to sit in is a taste preference, not a property of the file.
+
+`environmentActive()` (line 738) is the gate: an environment only renders when
+`projection === 'flat'`. The 180/360/fisheye paths wrap the viewer in a
+radius-50 sphere that would swallow any room, so there is nothing to show. The
+reverse also holds — `applyEnvironment` (line 942) switches the projection to
+`flat` when a room is chosen, because asking for the room means asking for the
+screen the room is built around.
+
+### 4.1 Scene graph
+
+```
+world
+ └─ videoRoot            (y = +1.6, rotated by drag-to-pan)
+     ├─ left/right video meshes   layers 1 / 2 (or 0 when mono)
+     └─ environmentRoot  (y = -1.6 → room floor lands at world y = 0)
+         ├─ room shell, seats, aisle lights, 3 lights   layer 0
+         └─ jvr-screen-surround   masking frame + additive bleed
+```
+
+Parenting the room to `videoRoot` rather than to `world` is what keeps the room
+and the screen rotation-locked when the user drags to pan. The -1.6 offset lets
+`buildTheater` be authored in ordinary room coordinates with the floor at y = 0.
+
+**Everything in the room is on layer 0.** `configureEyeLayers` (line 1055)
+enables layer 0 for both XR eye cameras, so the room is drawn to both eyes and
+the headset's own stereo cameras give it real depth for free. Putting a room
+object on layer 1 or 2 by accident would make it visible to one eye only.
+
+### 4.2 Screen sizing
+
+`computeScreenLayout` (line 765) replaced the hardcoded 7.2 × 4.05 plane. It
+returns `{ width, height, y, z }` in `videoRoot`-local space from a per-
+environment preset plus the video's aspect ratio:
+
+| Environment | Height | Max width | Distance | Centre (eye-relative) |
+| --- | --- | --- | --- | --- |
+| `void` | 4.05 | 9.0 | 4.5 m | 0 |
+| `theater` | 6.75 | 16.0 | 9.3 m | +1.3 |
+
+Void at 16:9 still evaluates to exactly 7.2 × 4.05 at z = -4.5, so nothing about
+the pre-existing cinema mode moved.
+
+`videoAspect` (line 748) is the subtle part. **Pixel dimensions alone do not
+give the display aspect of one eye.** In *half*-SBS/OU each eye is squeezed back
+into an ordinary frame, so the eye's pixels are anamorphic and the container
+aspect already *is* the display aspect; in *full*-SBS/OU the frame is genuinely
+twice as wide (or tall) and must be halved. The two are told apart by which
+reading lands in the normal range of display ratios (1.2 – 2.7), with the half
+packing tried first so an SBS frame at 2.4:1 reads as half-SBS scope rather than
+full-SBS of 1.2:1 content. All four packings of a 16:9 master — half/full × SBS/OU
+— converge on a 16:9 screen.
+
+### 4.3 Theater geometry
+
+`buildTheater` (line 803) builds from `PlaneGeometry` + `MeshLambertMaterial`.
+The load-bearing decision is the **stepped floor**: the viewer's row is at y = 0
+and the floor drops to an orchestra pit at y = -2.2 from z = -2 forward. Without
+it a 6.75 m screen hung at eye height would have its bottom edge below the floor
+the user is standing on. It is also how real cinemas are shaped.
+
+Room shell: 18 m wide (walls at x = ±9), ceiling at y = 8, screen wall at
+z = -9.6, back wall at z = +7. Seats are one `InstancedMesh` of 65 boxes in the
+pit, staggered row to row. Twelve small unlit planes are aisle strip lights.
+
+Lighting is one `AmbientLight` plus two `PointLight`s, both with **`decay = 0`**.
+That switches off the inverse-square term and leaves a plain distance window,
+which is far easier to tune than physical candela for a room this size. Video
+materials stay unlit (`MeshBasicMaterial`/`ShaderMaterial`), so the lights only
+touch room surfaces.
+
+`buildScreenSurround` (line 877) is separate from the room and rebuilt on every
+layout change, because the masking frame has to track a screen whose width
+follows the video's aspect ratio. It is four black opaque planes at z - 0.05 and
+one additive halo at z - 0.18, both behind the video plane and in front of the
+screen wall.
+
+### 4.4 Lifecycle hooks
+
+- `buildRenderer` (line 685) creates the empty `environmentRoot`.
+- `rebuildVideoMeshes` (line 1016) recomputes `screenLayout` and calls
+  `syncEnvironment` (line 933) *before* the video-texture guard, so the room
+  tracks mode changes even before a texture exists.
+- `buildEnvironment` (line 919) is idempotent via `environmentBuilt`; the room
+  is constructed once and then only shown/hidden.
+- `updateTriggerDrag` clamps pitch to 0 while an environment is active, so
+  drag-to-pan is yaw-only and the room cannot be tilted off-level.
+- `closePlayer` disposes the whole `environmentRoot` tree, including
+  `InstancedMesh.dispose()` for the seat instance buffers.
+
+## 5. Mode auto-detection
+
+`resolveMode` (line 315) picks a projection/stereo pair from three tiers, highest
 priority first:
 
-1. **Saved override** for the Jellyfin item id — `readStoredModes` (line 322) /
-   `rememberMode` (line 330), in `localStorage` under `jvr.modes.v1`, capped at
+1. **Saved override** for the Jellyfin item id — `readStoredModes` (line 335) /
+   `rememberMode` (line 343), in `localStorage` under `jvr.modes.v1`, capped at
    200 entries with oldest-first eviction.
-2. **Markers in the item name or file path** — `detectFromText` (line 274)
+2. **Markers in the item name or file path** — `detectFromText` (line 287)
    tokenises on non-alphanumerics and matches `PROJECTION_TOKENS` /
-   `STEREO_TOKENS`. `stereoFromToken` (line 268) additionally strips `half`,
+   `STEREO_TOKENS`. `stereoFromToken` (line 281) additionally strips `half`,
    `full` and `3d` affixes so `HalfOU`, `FullSBS`, `SBS3D` and `3DTB` resolve.
    Lens profiles (`MKX200`, `RF52`, `VRCA220`, `fisheye190`) imply `fisheye`;
    `_RL` implies side-by-side with swapped eyes.
-3. **Aspect ratio** — `detectFromAspect` (line 286): 4:1 → 360/SBS,
+3. **Aspect ratio** — `detectFromAspect` (line 299): 4:1 → 360/SBS,
    3.56:1 → flat/SBS, 2:1 → 180/SBS, 1:1 → 180/mono, 0.5:1 → 180/OU,
    0.89:1 → flat/OU, 1.6–2.45 → flat/mono.
 
@@ -135,11 +235,11 @@ Two rules matter more than they look:
 - **The VR aspect rules are gated on width** (≥3000px for 2:1, ≥2000px for 1:1).
   Without that gate a 2.00:1 or 2.35:1 cinema master is misread as 180/SBS.
 
-Because the stream URL carries no file name, `loadItemText` (line 387) fetches
+Because the stream URL carries no file name, `loadItemText` (line 400) fetches
 the item record for `Name`, `OriginalTitle`, `Path` and `MediaSources[].Path`.
 It tries the user-scoped route (`/Users/{userId}/Items/{id}`) before the flat one
 (`/Items/{id}`), since the endpoint moved between Jellyfin versions, and falls
-back to `document.title`. `autoDetectMode` (line 352) waits for both the video
+back to `document.title`. `autoDetectMode` (line 365) waits for both the video
 dimensions and the metadata fetch, with a 2.5 s timeout so a hung API cannot
 block detection.
 
@@ -147,35 +247,35 @@ Known false positive: a 2D film with `3D` glued into its filename
 (`Spy_Kids_3D_Game_Over`) is read as stereo. The user's correction persists, so
 it is a one-time fix per item.
 
-## 5. Jellyfin API adapter
+## 6. Jellyfin API adapter
 
-`readJellyfinContext` (line 134) derives everything needed to call the API —
+`readJellyfinContext` (line 147) derives everything needed to call the API —
 `itemId`, `MediaSourceId`, `PlaySessionId`, `api_key`, `DeviceId` — straight out
 of the stream URL Jellyfin already built for its own player, consulting
 `window.ApiClient` only to fill gaps. That keeps the adapter independent of
-ApiClient's method signatures. `jellyfinRequest` (line 161) and
-`jellyfinGetJson` (line 373) are the two transports; both authenticate with an
+ApiClient's method signatures. `jellyfinRequest` (line 174) and
+`jellyfinGetJson` (line 386) are the two transports; both authenticate with an
 `X-Emby-Token` header and fail closed by returning `false`/`null`.
 
-## 6. The dual-source model (original vs. H.264 compat)
+## 7. The dual-source model (original vs. H.264 compat)
 
 Quest Browser cannot always decode what Jellyfin direct-plays (HEVC, 10-bit)
 into a WebGL texture. The script handles this with a second, hidden video:
 
-- `buildCompatStreamUrl` (line 411) rewrites `/Videos/{id}/stream` to
+- `buildCompatStreamUrl` (line 424) rewrites `/Videos/{id}/stream` to
   `/Videos/{id}/stream.mp4` and forces `VideoCodec=h264`, `AudioCodec=aac`,
   `MaxVideoBitDepth=8`, `RequireAvc=true`, 40 Mbps, 4096×4096 cap, stream-copy
   disabled. It **strips `SubtitleStreamIndex` and `SubtitleMethod`**.
-- `startCompatAt(position)` (line 1121) creates a 2×2 px `#jvr-compat-video`,
+- `startCompatAt(position)` (line 1385) creates a 2×2 px `#jvr-compat-video`,
   bakes `StartTimeTicks` into the URL, and records `compatOffset`.
 - Because the transcode starts at an offset, all time math goes through
-  `getCurrentTime()` (line 442) = `compatOffset + video.currentTime`, and
-  `seekAbsolute` (line 1205) restarts the transcode whenever the target falls
+  `getCurrentTime()` (line 455) = `compatOffset + video.currentTime`, and
+  `seekAbsolute` (line 1469) restarts the transcode whenever the target falls
   outside the loaded segment.
 - `loadSerial` is the stale-response guard for overlapping loads.
 
 **Progress reporting.** Jellyfin stops advancing watch history while its own
-`<video>` is parked, so `reportProgress` (line 181) POSTs to
+`<video>` is parked, so `reportProgress` (line 194) POSTs to
 `/Sessions/Playing/Progress` on a 10 s interval plus on play/pause/seek,
 deduplicated by position+paused state. Reports go out under Jellyfin's
 *original* `PlaySessionId` so they land on the session the server already knows.
@@ -190,40 +290,40 @@ triggering transcode restarts on the original stream, which is worse.
 
 **Transcode cleanup.** The compat stream gets its own generated
 `PlaySessionId` (`newCompatSessionId`, line 212) rather than reusing Jellyfin's.
-That is a safety property, not cosmetics: `stopEncoding` (line 222) issues
+That is a safety property, not cosmetics: `stopEncoding` (line 235) issues
 `DELETE /Videos/ActiveEncodings`, and keyed on the shared id it would have
 killed Jellyfin's own transcode of the original source. Cleanup fires on
 seek-restart, source switch, player close and `pagehide`; requests use
 `keepalive: true` so teardown survives the headset sleeping.
 
-## 7. In-VR UI
+## 8. In-VR UI
 
-The control panel is a 1600×720 `<canvas>` painted by `drawPanel` (line 611) and
+The control panel is a 1600×720 `<canvas>` painted by `drawPanel` (line 626) and
 mapped onto a 1.82 × 0.82 m plane **parented to the camera**, so it is
 head-locked until dragged.
 
-- Hit-testing is UV-based: `raycastPanel` (line 838) → `panelActionFromIntersection`
-  (line 847) converts `intersection.uv` to canvas pixels and matches against the
-  `panelButtons` rect list that `addPanelButton` (line 579) rebuilds on every draw.
+- Hit-testing is UV-based: `raycastPanel` (line 1100) → `panelActionFromIntersection`
+  (line 1109) converts `intersection.uv` to canvas pixels and matches against the
+  `panelButtons` rect list that `addPanelButton` (line 594) rebuilds on every draw.
 - Three interaction zones share the trigger, disambiguated in `beginTrigger`
-  (line 893): the timeline strip → scrub; the 62 px border → drag the panel in
+  (line 1155): the timeline strip → scrub; the 62 px border → drag the panel in
   space; anything else → button click, or when the panel is hidden,
   drag-to-rotate the video sphere (`videoRoot.rotation`).
-- Grip toggles the panel; holding grip 1200 ms calls `resetAll` (line 1053).
-- `pollGamepads` (line 1014) reads raw `xrSession.inputSources`: button 4 = play/pause,
+- Grip toggles the panel; holding grip 1200 ms calls `resetAll` (line 1317).
+- `pollGamepads` (line 1278) reads raw `xrSession.inputSources`: button 4 = play/pause,
   button 5 = panel toggle, thumbstick X = ±10 s with a 650 ms repeat gate.
 - `drawPanel` repaints the whole canvas on every `timeupdate` **and** every 250 ms
   from `renderFrame`. That is a full 1600×720 CPU repaint plus a texture upload,
   several times a second, for a panel that is mostly static.
 
 There is also a 2D DOM toolbar (`buildOverlay`, line 481) used before entering
-VR, handled by `handleToolbar` (line 1296). It duplicates the panel's actions.
+VR, handled by `handleToolbar` (line 1564). It duplicates the panel's actions.
 
 UI strings are English. There is no i18n layer, so the Chinese-locale selectors
-in `locateControls` (line 1447) are load-bearing — they are how the VR button
+in `locateControls` (line 1724) are load-bearing — they are how the VR button
 finds its anchor on a Chinese Jellyfin install.
 
-## 8. Upgrade surfaces
+## 9. Upgrade surfaces
 
 Ranked roughly by value-per-effort, all compatible with keeping the 3D path.
 
@@ -247,9 +347,9 @@ Ranked roughly by value-per-effort, all compatible with keeping the 3D path.
 5. **Fisheye FOV parameter.** Make the shader take a real FOV (180/190/200) and
    an equidistant mapping instead of the current fixed approximation. Detection
    already recognises the lens profiles; the renderer ignores them.
-6. **Cinema mode depth.** `flat` is a bare plane in a black void. A curved screen,
-   an adjustable size/distance, and a minimal environment would make 3D movie
-   playback — the feature to preserve — substantially better.
+6. **Cinema mode depth.** Partly done — section 4 adds the `theater`
+   environment and aspect-correct screen sizing. Still open: a curved screen,
+   a user-adjustable size/distance, and more rooms than the one.
 7. **Volume control.** Only a mute toggle exists; no slider, no audio track picker.
 8. **`scan()` debouncing.** The MutationObserver fires on every mutation of
    Jellyfin's very busy DOM with no throttle, alongside a 1 s interval.
@@ -268,11 +368,11 @@ Ranked roughly by value-per-effort, all compatible with keeping the 3D path.
 12. **i18n**, given the README is bilingual and the UI is now English-only.
 13. **Hand tracking** is requested as an optional feature in `enterVr` but never used.
 
-## 9. Invariants to respect
+## 10. Invariants to respect
 
 - Must remain one file, pasteable into JS Injector, no module syntax at top level.
 - Must not replace or detach Jellyfin's `<video>` element; the overlay sits on top.
-- `closePlayer` (line 1348) must keep restoring `currentTime`, `muted`, `volume`
+- `closePlayer` (line 1618) must keep restoring `currentTime`, `muted`, `volume`
   and the original element `id` — that is what makes the return to Jellyfin seamless.
 - `stopEncoding` must only ever be handed a `PlaySessionId` we generated. Passing
   Jellyfin's own id would kill the original stream out from under its player.

@@ -18,6 +18,14 @@
   const MODE_STORE_KEY = 'jvr.modes.v1';
   const MODE_STORE_LIMIT = 200;
   const METADATA_TIMEOUT = 2500;
+  const ENV_STORE_KEY = 'jvr.env.v1';
+  const ENVIRONMENTS = ['void', 'theater'];
+  const EYE_HEIGHT = 1.6;
+  // Screen placement per environment, in videoRoot-local space (origin at eye height).
+  const SCREEN_LAYOUTS = {
+    void: { height: 4.05, maxWidth: 9, distance: 4.5, centerY: 0 },
+    theater: { height: 6.75, maxWidth: 16, distance: 9.3, centerY: 1.3 }
+  };
 
   let overlay = null;
   let statusEl = null;
@@ -46,6 +54,11 @@
   let videoTexture = null;
   let videoRoot = null;
   let videoMeshes = [];
+  let environmentName = 'theater';
+  let environmentRoot = null;
+  let environmentBuilt = '';
+  let screenSurround = null;
+  let screenLayout = { width: 7.2, height: 4.05, y: 0, z: -4.5 };
   let controllers = [];
   let panelMesh = null;
   let panelCanvas = null;
@@ -495,6 +508,8 @@
       .forEach(([label, value]) => bar.append(createButton(label, 'projection', value)));
     [['Mono', 'mono'], ['SBS', 'sbs'], ['OU', 'ou']]
       .forEach(([label, value]) => bar.append(createButton(label, 'stereo', value)));
+    [['Void', 'void'], ['Theater', 'theater']]
+      .forEach(([label, value]) => bar.append(createButton(label, 'environment', value)));
     bar.append(createButton('Swap Eyes', 'swap'));
     const source = createButton('Original Source', 'source');
     source.id = 'jvr-source-toggle';
@@ -656,10 +671,11 @@
     addPanelButton(905, 275, 210, 105, currentMode.projection.toUpperCase(), 'projection');
     addPanelButton(1135, 275, 180, 105, currentMode.stereo.toUpperCase(), 'stereo');
     addPanelButton(1335, 275, 210, 105, sourceMode === 'compat' ? 'H264' : 'SOURCE', 'source', '#25536a');
-    addPanelButton(55, 435, 330, 105, 'SWAP EYES', 'swap');
-    addPanelButton(425, 435, 330, 105, 'RESET ALL', 'reset', '#365061');
-    addPanelButton(795, 435, 330, 105, 'HIDE PANEL', 'hide');
-    addPanelButton(1165, 435, 380, 105, 'EXIT VR', 'exit-vr', '#652d34');
+    addPanelButton(55, 435, 282, 105, 'SWAP EYES', 'swap');
+    addPanelButton(357, 435, 282, 105, environmentName.toUpperCase(), 'environment', '#2d4a40');
+    addPanelButton(659, 435, 282, 105, 'RESET ALL', 'reset', '#365061');
+    addPanelButton(961, 435, 282, 105, 'HIDE PANEL', 'hide');
+    addPanelButton(1263, 435, 282, 105, 'EXIT VR', 'exit-vr', '#652d34');
     context.fillStyle = '#81909f';
     context.font = '36px system-ui, sans-serif';
     context.fillText('Timeline: hold to scrub  ·  Hold trigger to pan the view  ·  Hold grip to reset', 800, 635);
@@ -670,14 +686,20 @@
     world = new THREE.Scene();
     world.background = new THREE.Color(0x000000);
     camera = new THREE.PerspectiveCamera(75, innerWidth / innerHeight, 0.01, 120);
-    camera.position.set(0, 1.6, 0);
+    camera.position.set(0, EYE_HEIGHT, 0);
     camera.layers.enable(0);
     camera.layers.enable(1);
     world.add(camera);
     videoRoot = new THREE.Group();
     videoRoot.name = 'jvr-video-view-root';
-    videoRoot.position.set(0, 1.6, 0);
+    videoRoot.position.set(0, EYE_HEIGHT, 0);
     world.add(videoRoot);
+    environmentRoot = new THREE.Group();
+    environmentRoot.name = 'jvr-environment-root';
+    environmentRoot.position.set(0, -EYE_HEIGHT, 0);
+    environmentRoot.visible = false;
+    environmentBuilt = '';
+    videoRoot.add(environmentRoot);
     renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false, powerPreference: 'high-performance' });
     renderer.outputColorSpace = THREE.SRGBColorSpace;
     renderer.setPixelRatio(Math.min(devicePixelRatio || 1, 2));
@@ -698,13 +720,249 @@
     renderer.setAnimationLoop(renderFrame);
   }
 
+  function readStoredEnvironment() {
+    try {
+      const value = localStorage.getItem(ENV_STORE_KEY);
+      return ENVIRONMENTS.includes(value) ? value : 'theater';
+    } catch (_) {
+      return 'theater';
+    }
+  }
+
+  function rememberEnvironment() {
+    try { localStorage.setItem(ENV_STORE_KEY, environmentName); } catch (_) {}
+  }
+
+  // An environment is only meaningful behind a flat screen: 180/360/fisheye wrap
+  // the viewer in a radius-50 sphere that would swallow any room geometry.
+  function environmentActive() {
+    return environmentName !== 'void' && currentMode.projection === 'flat';
+  }
+
+  // The display aspect of one eye, which is what the screen has to be shaped
+  // like. Pixel dimensions alone cannot answer this: in *half*-SBS/OU each eye
+  // is squeezed back into an ordinary frame, so the eye's pixels are anamorphic
+  // and the container aspect is already the display aspect; in *full*-SBS/OU the
+  // frame is genuinely twice as wide (or tall) and has to be halved. The two are
+  // told apart by which reading lands in the normal range of display ratios.
+  function videoAspect() {
+    const width = activeVideo?.videoWidth || sourceVideo?.videoWidth || 0;
+    const height = activeVideo?.videoHeight || sourceVideo?.videoHeight || 0;
+    if (!width || !height) return 16 / 9;
+    const frame = width / height;
+    if (!Number.isFinite(frame) || frame <= 0) return 16 / 9;
+    const candidates = currentMode.stereo === 'sbs'
+      ? [frame, frame / 2]
+      : currentMode.stereo === 'ou'
+        ? [frame, frame * 2]
+        : [frame];
+    // Half packing is listed first, so it wins a tie such as an SBS frame at
+    // 2.4:1 (half-SBS scope, far more common than full-SBS of 1.2:1 content).
+    const plausible = candidates.find((value) => value >= 1.2 && value <= 2.7);
+    return THREE.MathUtils.clamp(plausible || candidates[0], 1, 3.2);
+  }
+
+  function computeScreenLayout() {
+    const preset = SCREEN_LAYOUTS[environmentActive() ? environmentName : 'void'];
+    const aspect = videoAspect();
+    let height = preset.height;
+    let width = height * aspect;
+    if (width > preset.maxWidth) {
+      width = preset.maxWidth;
+      height = width / aspect;
+    }
+    return { width, height, y: preset.centerY, z: -preset.distance };
+  }
+
+  function disposeTree(root) {
+    root?.traverse?.((object) => {
+      if (object.isInstancedMesh) object.dispose();
+      object.geometry?.dispose?.();
+      if (Array.isArray(object.material)) object.material.forEach((item) => item?.dispose?.());
+      else object.material?.dispose?.();
+    });
+  }
+
+  function addSurface(group, width, height, color, position, rotation) {
+    const mesh = new THREE.Mesh(
+      new THREE.PlaneGeometry(width, height),
+      new THREE.MeshLambertMaterial({ color })
+    );
+    mesh.position.set(position[0], position[1], position[2]);
+    if (rotation) mesh.rotation.set(rotation[0], rotation[1], rotation[2]);
+    mesh.layers.set(0);
+    group.add(mesh);
+    return mesh;
+  }
+
+  // Authored with the floor at y = 0 and the viewer standing at the origin;
+  // `environmentRoot` sits at -EYE_HEIGHT inside videoRoot, so the floor lands
+  // under the user's feet. The floor steps down to a pit in front of the row so
+  // a screen taller than eye height can hang below eye level without clipping
+  // through the ground the user is standing on.
+  function buildTheater(group) {
+    const CARPET = 0x2b1f2c;
+    const RISER = 0x1a1219;
+    const WALL = 0x1b1f26;
+    const CEILING = 0x12151a;
+    const FRONT = 0x0b0d10;
+    const HALF_WIDTH = 9;
+    const BACK_Z = 7;
+    const FRONT_Z = -9.6;
+    const PIT_Z = -2;
+    const PIT_Y = -2.2;
+    const TOP_Y = 8;
+    const length = BACK_Z - FRONT_Z;
+    const wallHeight = TOP_Y - PIT_Y;
+    const midY = (TOP_Y + PIT_Y) / 2;
+    const midZ = (BACK_Z + FRONT_Z) / 2;
+
+    addSurface(group, HALF_WIDTH * 2, BACK_Z - PIT_Z, CARPET, [0, 0, (BACK_Z + PIT_Z) / 2], [-Math.PI / 2, 0, 0]);
+    addSurface(group, HALF_WIDTH * 2, PIT_Z - FRONT_Z, CARPET, [0, PIT_Y, (PIT_Z + FRONT_Z) / 2], [-Math.PI / 2, 0, 0]);
+    addSurface(group, HALF_WIDTH * 2, -PIT_Y, RISER, [0, PIT_Y / 2, PIT_Z], null);
+    addSurface(group, HALF_WIDTH * 2, length, CEILING, [0, TOP_Y, midZ], [Math.PI / 2, 0, 0]);
+    addSurface(group, length, wallHeight, WALL, [-HALF_WIDTH, midY, midZ], [0, Math.PI / 2, 0]);
+    addSurface(group, length, wallHeight, WALL, [HALF_WIDTH, midY, midZ], [0, -Math.PI / 2, 0]);
+    addSurface(group, HALF_WIDTH * 2, wallHeight, FRONT, [0, midY, FRONT_Z], null);
+    addSurface(group, HALF_WIDTH * 2, wallHeight, WALL, [0, midY, BACK_Z], [0, Math.PI, 0]);
+
+    const rows = 5;
+    const perRow = 13;
+    const seatGeometry = new THREE.BoxGeometry(0.62, 0.92, 0.62);
+    seatGeometry.translate(0, 0.46, 0);
+    const seats = new THREE.InstancedMesh(
+      seatGeometry,
+      new THREE.MeshLambertMaterial({ color: 0x241c26 }),
+      rows * perRow
+    );
+    const matrix = new THREE.Matrix4();
+    let index = 0;
+    for (let row = 0; row < rows; row += 1) {
+      const stagger = row % 2 ? 0.37 : 0;
+      for (let seat = 0; seat < perRow; seat += 1) {
+        matrix.makeTranslation((seat - (perRow - 1) / 2) * 0.74 + stagger, PIT_Y, -7.4 + row * 1.12);
+        seats.setMatrixAt(index, matrix);
+        index += 1;
+      }
+    }
+    seats.instanceMatrix.needsUpdate = true;
+    seats.layers.set(0);
+    group.add(seats);
+
+    const stripGeometry = new THREE.PlaneGeometry(0.2, 0.07);
+    const stripMaterial = new THREE.MeshBasicMaterial({ color: 0xff9a55, transparent: true, opacity: 0.8 });
+    for (let step = 0; step < 6; step += 1) {
+      for (const side of [-1, 1]) {
+        const strip = new THREE.Mesh(stripGeometry, stripMaterial);
+        strip.position.set(side * (HALF_WIDTH - 0.02), PIT_Y + 0.38, -8.8 + step * 1.25);
+        strip.rotation.y = side < 0 ? Math.PI / 2 : -Math.PI / 2;
+        strip.layers.set(0);
+        group.add(strip);
+      }
+    }
+
+    group.add(new THREE.AmbientLight(0x2b3442, 1.1));
+    // decay 0 turns off the inverse-square term, leaving a plain distance window
+    // that is far easier to tune than physical units for a room this size.
+    const screenGlow = new THREE.PointLight(0xa8ccf0, 2.2, 30, 0);
+    screenGlow.position.set(0, EYE_HEIGHT + SCREEN_LAYOUTS.theater.centerY, -8.6);
+    group.add(screenGlow);
+    const houseLight = new THREE.PointLight(0xff9a55, 0.45, 18, 0);
+    houseLight.position.set(0, TOP_Y - 1.2, 3);
+    group.add(houseLight);
+  }
+
+  // The masking frame has to track the screen, whose width follows the video's
+  // aspect ratio, so it is rebuilt separately from the (static) room.
+  function buildScreenSurround() {
+    if (screenSurround) {
+      screenSurround.parent?.remove(screenSurround);
+      disposeTree(screenSurround);
+      screenSurround = null;
+    }
+    if (!environmentRoot || !environmentActive()) return;
+    const { width, height, y, z } = screenLayout;
+    const centerY = y + EYE_HEIGHT;
+    const group = new THREE.Group();
+    group.name = 'jvr-screen-surround';
+    const thickness = 0.32;
+    const maskMaterial = new THREE.MeshBasicMaterial({ color: 0x050607 });
+    const pieces = [
+      [width + thickness * 2, thickness, 0, height / 2 + thickness / 2],
+      [width + thickness * 2, thickness, 0, -height / 2 - thickness / 2],
+      [thickness, height, -width / 2 - thickness / 2, 0],
+      [thickness, height, width / 2 + thickness / 2, 0]
+    ];
+    for (const [pieceWidth, pieceHeight, offsetX, offsetY] of pieces) {
+      const piece = new THREE.Mesh(new THREE.PlaneGeometry(pieceWidth, pieceHeight), maskMaterial);
+      piece.position.set(offsetX, centerY + offsetY, z - 0.05);
+      piece.layers.set(0);
+      group.add(piece);
+    }
+    const bleed = new THREE.Mesh(
+      new THREE.PlaneGeometry(width + 3.2, height + 2.4),
+      new THREE.MeshBasicMaterial({
+        color: 0x3f7ea6,
+        transparent: true,
+        opacity: 0.22,
+        blending: THREE.AdditiveBlending,
+        depthWrite: false
+      })
+    );
+    bleed.position.set(0, centerY, z - 0.18);
+    bleed.layers.set(0);
+    group.add(bleed);
+    environmentRoot.add(group);
+    screenSurround = group;
+  }
+
+  function buildEnvironment() {
+    if (!environmentRoot) return;
+    const wanted = environmentActive() ? environmentName : '';
+    if (environmentBuilt === wanted) return;
+    for (let index = environmentRoot.children.length - 1; index >= 0; index -= 1) {
+      const child = environmentRoot.children[index];
+      environmentRoot.remove(child);
+      disposeTree(child);
+    }
+    screenSurround = null;
+    environmentBuilt = wanted;
+    if (wanted === 'theater') buildTheater(environmentRoot);
+  }
+
+  function syncEnvironment() {
+    if (!environmentRoot) return;
+    buildEnvironment();
+    buildScreenSurround();
+    environmentRoot.visible = environmentActive();
+    // A room has a horizon; keep it level even if the view was pitched earlier.
+    if (environmentActive() && videoRoot) videoRoot.rotation.x = 0;
+  }
+
+  function applyEnvironment(name, remember) {
+    if (!ENVIRONMENTS.includes(name)) return;
+    environmentName = name;
+    if (remember) rememberEnvironment();
+    // Asking for a room implies asking for the screen the room is built around.
+    if (environmentName !== 'void' && currentMode.projection !== 'flat') {
+      applyMode({ projection: 'flat' }, remember);
+      return;
+    }
+    rebuildVideoMeshes();
+  }
+
+  function cycleEnvironment() {
+    const next = ENVIRONMENTS[(ENVIRONMENTS.indexOf(environmentName) + 1) % ENVIRONMENTS.length];
+    applyEnvironment(next, true);
+  }
+
   function makeGeometry(projection, eye) {
     let geometry;
     if (projection === '360') {
       geometry = new THREE.SphereGeometry(50, 64, 32, 0, Math.PI * 2, 0, Math.PI);
       geometry.scale(-1, 1, 1);
     } else if (projection === 'flat') {
-      geometry = new THREE.PlaneGeometry(7.2, 4.05, 1, 1);
+      geometry = new THREE.PlaneGeometry(screenLayout.width, screenLayout.height, 1, 1);
     } else {
       geometry = new THREE.SphereGeometry(50, 64, 32, -Math.PI / 2, Math.PI, 0, Math.PI);
       geometry.scale(-1, 1, 1);
@@ -756,24 +1014,28 @@
   }
 
   function rebuildVideoMeshes() {
-    if (!world || !videoTexture) return;
-    disposeVideoMeshes();
-    const stereo = currentMode.stereo !== 'mono';
-    const left = new THREE.Mesh(makeGeometry(currentMode.projection, 0), makeMaterial(0));
-    left.name = 'jvr-left-video';
-    if (currentMode.projection === 'flat') left.position.set(0, 0, -4.5);
-    else if (currentMode.projection !== '360') left.rotation.y = Math.PI / 2;
-    left.layers.set(stereo ? 1 : 0);
+    if (!world) return;
+    screenLayout = computeScreenLayout();
+    syncEnvironment();
+    if (videoTexture) {
+      disposeVideoMeshes();
+      const stereo = currentMode.stereo !== 'mono';
+      const left = new THREE.Mesh(makeGeometry(currentMode.projection, 0), makeMaterial(0));
+      left.name = 'jvr-left-video';
+      if (currentMode.projection === 'flat') left.position.set(0, screenLayout.y, screenLayout.z);
+      else if (currentMode.projection !== '360') left.rotation.y = Math.PI / 2;
+      left.layers.set(stereo ? 1 : 0);
       videoRoot.add(left);
-    videoMeshes.push(left);
-    if (stereo) {
-      const right = new THREE.Mesh(makeGeometry(currentMode.projection, 1), makeMaterial(1));
-      right.name = 'jvr-right-video';
-      if (currentMode.projection === 'flat') right.position.set(0, 0, -4.5);
-      else if (currentMode.projection !== '360') right.rotation.y = Math.PI / 2;
-      right.layers.set(2);
-      videoRoot.add(right);
-      videoMeshes.push(right);
+      videoMeshes.push(left);
+      if (stereo) {
+        const right = new THREE.Mesh(makeGeometry(currentMode.projection, 1), makeMaterial(1));
+        right.name = 'jvr-right-video';
+        if (currentMode.projection === 'flat') right.position.set(0, screenLayout.y, screenLayout.z);
+        else if (currentMode.projection !== '360') right.rotation.y = Math.PI / 2;
+        right.layers.set(2);
+        videoRoot.add(right);
+        videoMeshes.push(right);
+      }
     }
     updateToolbar();
     drawPanel();
@@ -948,7 +1210,9 @@
     const startPitch = Math.asin(THREE.MathUtils.clamp(start.y, -1, 1));
     const currentPitch = Math.asin(THREE.MathUtils.clamp(current.y, -1, 1));
     videoRoot.rotation.y = dragState.startYaw - (currentYaw - startYaw) * 1.35;
-    videoRoot.rotation.x = THREE.MathUtils.clamp(dragState.startPitch + (currentPitch - startPitch) * 1.1, -Math.PI / 2, Math.PI / 2);
+    videoRoot.rotation.x = environmentActive()
+      ? 0
+      : THREE.MathUtils.clamp(dragState.startPitch + (currentPitch - startPitch) * 1.1, -Math.PI / 2, Math.PI / 2);
     dragState.moved = dragState.moved || Math.abs(currentYaw - startYaw) > 0.025 || Math.abs(currentPitch - startPitch) > 0.025;
   }
 
@@ -1237,6 +1501,7 @@
     else if (action === 'mute') activeVideo.muted = !activeVideo.muted;
     else if (action === 'projection') cycleProjection();
     else if (action === 'stereo') cycleStereo();
+    else if (action === 'environment') cycleEnvironment();
     else if (action === 'swap') applyMode({ swap: !currentMode.swap }, true);
     else if (action === 'source') toggleSource();
     else if (action === 'reset') resetAll();
@@ -1252,6 +1517,9 @@
     });
     overlay.querySelectorAll('[data-action="stereo"][data-value]').forEach((button) => {
       button.classList.toggle('active', button.dataset.value === currentMode.stereo);
+    });
+    overlay.querySelectorAll('[data-action="environment"][data-value]').forEach((button) => {
+      button.classList.toggle('active', button.dataset.value === environmentName);
     });
     const sourceButton = overlay.querySelector('#jvr-source-toggle');
     if (sourceButton) {
@@ -1301,6 +1569,7 @@
     else if (action === 'enter') enterVr();
     else if (action === 'projection') applyMode({ projection: value }, true);
     else if (action === 'stereo') applyMode({ stereo: value }, true);
+    else if (action === 'environment') applyEnvironment(value, true);
     else if (action === 'swap') applyMode({ swap: !currentMode.swap }, true);
     else if (action === 'source') toggleSource();
   }
@@ -1317,6 +1586,7 @@
       itemTextReady = false;
       itemText = '';
       detectionMessage = '';
+      environmentName = readStoredEnvironment();
       detectionTimer = setTimeout(() => {
         itemTextReady = true;
         autoDetectMode();
@@ -1376,6 +1646,10 @@
     }
     renderer?.setAnimationLoop?.(null);
     disposeVideoMeshes();
+    if (environmentRoot) {
+      environmentRoot.parent?.remove(environmentRoot);
+      disposeTree(environmentRoot);
+    }
     videoTexture?.dispose?.();
     panelMesh?.geometry?.dispose?.();
     panelMesh?.material?.dispose?.();
@@ -1423,6 +1697,9 @@
     videoTexture = null;
     videoMeshes = [];
     videoRoot = null;
+    environmentRoot = null;
+    environmentBuilt = '';
+    screenSurround = null;
     controllers = [];
     panelMesh = null;
     panelCanvas = null;
