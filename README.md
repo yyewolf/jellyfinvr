@@ -120,7 +120,17 @@ Library
 → Play
 ```
 
-If the script loads correctly, VR-related controls should appear in the player.
+If the script loads correctly, the player's settings menu gains a
+**Watch in VR** entry:
+
+```text
+Player
+→ Settings (gear icon)
+→ Watch in VR
+```
+
+Nothing is added to the player's control bar, so Jellyfin looks untouched until
+you open that menu.
 
 On Meta Quest, simply use:
 
@@ -128,7 +138,8 @@ On Meta Quest, simply use:
 Meta Quest Browser
 → Jellyfin Web
 → Movie
-→ VR
+→ Settings
+→ Watch in VR
 ```
 
 No Tampermonkey or separate Quest application is required when using JavaScript Injector.
@@ -221,9 +232,12 @@ Then disable or delete the script.
 
 ## Troubleshooting
 
-### VR button does not appear
+### "Watch in VR" does not appear in the player menu
 
-Check:
+The entry is added to the player's settings menu, not to the control bar. Start
+playback, then open the gear icon in the player.
+
+If it is still missing, check:
 
 ```text
 Dashboard
@@ -251,6 +265,14 @@ Ctrl + Shift + R
 ```
 
 On Meta Quest Browser, close the Jellyfin page and open it again.
+
+If the menu entry still does not show up, your Jellyfin build may render its
+player menu differently. You can start the VR player directly from the browser
+console as a fallback:
+
+```text
+jellyfinVR.open()
+```
 
 ### VR mode does not start
 
@@ -456,7 +478,15 @@ Enabled
 → 播放
 ```
 
-如果脚本成功加载，播放器中会出现 VR 相关控制入口。
+如果脚本成功加载，播放器的设置菜单中会出现 **Watch in VR** 选项：
+
+```text
+播放器
+→ 设置（齿轮图标）
+→ Watch in VR
+```
+
+播放器控制栏不会新增任何按钮，因此在打开该菜单之前，Jellyfin 界面保持原样。
 
 Meta Quest 推荐直接使用：
 
@@ -464,7 +494,8 @@ Meta Quest 推荐直接使用：
 Meta Quest Browser
 → Jellyfin Web
 → 影片
-→ VR
+→ 设置
+→ Watch in VR
 ```
 
 使用 JavaScript Injector 后，无需在 Quest 上额外安装 Tampermonkey 或独立应用。
@@ -557,9 +588,11 @@ Jellyfin VR Player
 
 ## 故障排除
 
-### 没有出现 VR 按钮
+### 播放器菜单中没有 "Watch in VR"
 
-进入：
+该入口位于播放器的设置菜单中，而不是控制栏。请先开始播放，再点击播放器中的齿轮图标。
+
+如果仍然没有，请进入：
 
 ```text
 控制台
@@ -587,6 +620,13 @@ Ctrl + Shift + R
 ```
 
 Quest Browser 可以关闭 Jellyfin 页面后重新打开。
+
+如果菜单入口仍然不出现，说明你的 Jellyfin 版本渲染播放器菜单的方式不同。
+可以在浏览器控制台中直接启动 VR 播放器作为备用方式：
+
+```text
+jellyfinVR.open()
+```
 
 ### VR 模式无法启动
 

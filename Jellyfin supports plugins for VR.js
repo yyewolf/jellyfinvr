@@ -8,7 +8,12 @@
   window.__JELLYFIN_VR_V42__ = true;
 
   const THREE_URL = 'https://cdn.jsdelivr.net/npm/three@0.160.1/build/three.min.js';
-  const BUTTON_ID = 'jvr-v4-button';
+  const MENU_ITEM_ID = 'jvr-menu-item';
+  const MENU_ITEM_LABEL = 'Watch in VR';
+  // Jellyfin renders every popup menu, including the video OSD's settings
+  // menu, through its actionSheet component.
+  const SHEET_SELECTOR = '.actionSheet,.actionsheet';
+  const SHEET_ITEM_SELECTOR = '.actionSheetMenuItem,.listItem-button';
   const OVERLAY_ID = 'jvr-v4-overlay';
   const PANEL_WIDTH = 1.82;
   const PANEL_HEIGHT = 0.82;
@@ -101,6 +106,7 @@
   let closing = false;
 
   let scanTimer = 0;
+  let scanScheduled = false;
   let resizeHandler = null;
   const inputStates = new WeakMap();
   const triggerStates = new WeakMap();
@@ -2256,43 +2262,93 @@
     closing = false;
   }
 
-  function locateControls() {
-    const fullscreen = document.querySelector('.btnFullscreen,[aria-label="Fullscreen"],[aria-label="全屏"],[title="Fullscreen"],[title="全屏"],.button-fullscreen');
-    if (fullscreen?.parentElement) return { parent: fullscreen.parentElement, before: fullscreen };
-    const bar = document.querySelector('.videoOsdBottom .buttons,.videoOsdBottom,.osdControls,.videoControls,[class*="videoOsdBottom"]');
-    return bar ? { parent: bar, before: null } : null;
+  // The VR entry lives in the player's own options menu rather than in the
+  // control bar, so nothing is added to the Jellyfin chrome until the user
+  // opens that menu.
+  //
+  // Jellyfin builds action sheets from its own markup, and the class names
+  // differ between versions and skins. Cloning a real item from the sheet we
+  // are augmenting is what keeps the entry looking native without hard-coding
+  // any of them — and, unlike the old control-bar anchor, it needs no
+  // locale-specific selectors.
+  function buildMenuItem(template) {
+    const item = template.cloneNode(true);
+    item.id = MENU_ITEM_ID;
+    for (const attribute of ['data-id', 'data-command', 'data-itemid', 'data-index']) {
+      item.removeAttribute(attribute);
+    }
+    item.setAttribute('title', MENU_ITEM_LABEL);
+    const icon = item.querySelector('.material-icons');
+    if (icon) {
+      // Keep the structural classes and drop the one naming the template's
+      // glyph; the icon font renders from the text content.
+      icon.className = Array.from(icon.classList)
+        .filter((name) => name === 'material-icons' || /listitem|actionsheet/i.test(name))
+        .join(' ');
+      icon.textContent = 'view_in_ar';
+    }
+    const label = item.querySelector('.actionSheetItemText,.listItemBodyText');
+    if (label) {
+      label.textContent = MENU_ITEM_LABEL;
+    } else {
+      item.childNodes.forEach((node) => { if (node.nodeType === 3) node.textContent = ''; });
+      const span = document.createElement('span');
+      span.textContent = MENU_ITEM_LABEL;
+      item.append(span);
+    }
+    item.querySelectorAll('.listItemAside,.actionSheetItemAsideText,.secondary').forEach((node) => node.remove());
+    item.addEventListener('click', () => {
+      // Jellyfin's delegated handler closes the sheet on a click anywhere in a
+      // menu item and resolves with our (absent) data-id, which its callers
+      // ignore. Let that run and open once the dialog has torn down.
+      setTimeout(openPlayer, 50);
+    });
+    return item;
   }
 
-  function addVrButton() {
-    if (document.getElementById(BUTTON_ID) || !findVideo()) return;
-    const target = locateControls();
-    const button = document.createElement('button');
-    button.id = BUTTON_ID;
-    button.type = 'button';
-    button.textContent = 'VR';
-    button.title = 'Jellyfin VR Player v4.2';
-    button.setAttribute('aria-label', 'VR Player');
-    button.onclick = openPlayer;
-    if (target) {
-      button.className = 'autoSize paper-icon-button-light';
-      button.style.cssText = 'min-width:42px;height:42px;border:0;background:transparent;color:inherit;font-weight:800;font-size:13px;cursor:pointer';
-      target.parent.insertBefore(button, target.before);
-    } else {
-      button.style.cssText = 'position:fixed;right:18px;bottom:90px;z-index:2147483000;width:50px;height:50px;border:1px solid #ffffff55;border-radius:50%;background:#006d91e8;color:#fff;font-weight:800;cursor:pointer';
-      document.body.append(button);
-    }
+  // Only offer VR while a video is actually on screen. Jellyfin leaves a
+  // <video> in the DOM after playback, so the element alone is not enough —
+  // a collapsed one means we are back in the library, where an item's context
+  // menu is also an action sheet and must not gain a VR entry.
+  function playerActive() {
+    const video = findVideo();
+    if (!video) return false;
+    const rect = video.getBoundingClientRect();
+    return rect.width > 100 && rect.height > 100;
+  }
+
+  function augmentSheet(sheet) {
+    if (sheet.dataset.jvrMenu === '1' || sheet.querySelector(`#${MENU_ITEM_ID}`)) return;
+    const items = sheet.querySelectorAll(SHEET_ITEM_SELECTOR);
+    const template = items[items.length - 1];
+    if (!template?.parentElement) return;
+    sheet.dataset.jvrMenu = '1';
+    template.parentElement.append(buildMenuItem(template));
   }
 
   function scan() {
-    const button = document.getElementById(BUTTON_ID);
-    if (findVideo()) addVrButton();
-    else button?.remove();
+    if (!playerActive()) return;
+    document.querySelectorAll(SHEET_SELECTOR).forEach(augmentSheet);
+  }
+
+  // The observer watches a very busy subtree, so coalesce bursts into one pass
+  // per frame instead of running a query for every mutation.
+  function scheduleScan() {
+    if (scanScheduled) return;
+    scanScheduled = true;
+    requestAnimationFrame(() => {
+      scanScheduled = false;
+      scan();
+    });
   }
 
   function init() {
     scan();
-    new MutationObserver(scan).observe(document.documentElement, { childList: true, subtree: true });
+    new MutationObserver(scheduleScan).observe(document.documentElement, { childList: true, subtree: true });
     scanTimer = setInterval(scan, 1000);
+    // Escape hatch: the menu entry depends on Jellyfin's action sheet markup,
+    // so keep a way in that does not.
+    window.jellyfinVR = { open: openPlayer, close: closePlayer };
     window.addEventListener('beforeunload', () => clearInterval(scanTimer), { once: true });
     window.addEventListener('pagehide', () => {
       reportProgress('timeupdate');
