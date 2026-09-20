@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Jellyfin VR - theater showcase</title>
+<style>
+  :root { --accent: #00a8e8; }
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  body { font-family: "Adwaita Sans", system-ui, sans-serif; color: #eef4fa; }
+  #stage { position: absolute; inset: 0; }
+  #stage canvas { display: block; width: 100%; height: 100%; }
+  .overlay { position: absolute; pointer-events: none; }
+
+  #caption { left: 4.2%; bottom: 8.5%; transition: none; }
+  #caption .rule { width: 3.4em; height: 3px; background: var(--accent); margin-bottom: 0.7em; }
+  #caption .title { font-size: 2.6vw; font-weight: 700; letter-spacing: 0.10em; line-height: 1.1; }
+  #caption .detail { font-size: 1.18vw; color: #b6c2ce; margin-top: 0.45em; letter-spacing: 0.02em; }
+
+  #hud { right: 4.2%; top: 7%; text-align: right; font-size: 1.05vw; letter-spacing: 0.14em; color: #92a1b0; }
+  #hud div { margin-bottom: 0.45em; }
+  #hud .seat { color: #eef4fa; }
+
+  #brand { left: 4.2%; top: 7%; font-size: 1.05vw; letter-spacing: 0.22em; color: #7e8b98; }
+  #brand b { color: #eef4fa; font-weight: 600; }
+
+  #track { left: 0; right: 0; bottom: 0; height: 4px; background: rgba(255,255,255,0.10); }
+  #progress { height: 100%; width: 0; background: var(--accent); }
+</style>
+</head>
+<body>
+  <div id="stage"></div>
+  <div id="brand" class="overlay"><b>JELLYFIN VR</b> &nbsp;THEATER</div>
+  <div id="hud" class="overlay"><div class="seat">SEAT MID</div><div class="lights">LIGHTS LOW</div></div>
+  <div id="caption" class="overlay"><div class="rule"></div><div class="title"></div><div class="detail"></div></div>
+  <div id="track" class="overlay"><div id="progress"></div></div>
+
+  <script src="three.min.js"></script>
+  <!-- The plugin, wrapped so its scope can be reached; see make-showcase.mjs. -->
+  <script src="plugin-exposed.js"></script>
+  <script src="showcase.js"></script>
+</body>
+</html>

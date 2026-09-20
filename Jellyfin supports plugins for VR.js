@@ -43,13 +43,30 @@
   // House lighting presets, as multipliers on what the room is built with. The
   // screen key and bounce lights are deliberately not in here: they stand in for
   // the picture itself, so they belong to the film rather than to the house.
+  // Nor are the EXIT signs, which are never off in a real auditorium and are
+  // what keeps the room readable at blackout.
+  //
+  // The room is authored at roughly house-lights-up brightness, so every level
+  // that is not FULL scales it down — LOW is a viewing level, not the as-built
+  // state. That matters: LOW is where a film is actually watched, so the room
+  // has to fall back far enough to stop competing with the screen. Walls, seats
+  // and fixtures stay legible, but as shapes in a dark room rather than as
+  // things worth looking at. The glow sprites on the sconces, aisle markers and
+  // downlights come down less than the lights that wash the walls, so the
+  // fixtures still read as fixtures once the surfaces around them go dark.
+  //
+  // The four are really two pairs. OUT and LOW are both watching levels — a
+  // blackout and a dim room — and sit close together well under 1. HALF and
+  // FULL are house-lights-up and sit above it. The gap in the middle is the
+  // point: there is no setting that half-lights the room while a film runs.
+  //
   // `fog` thins the haze as the lights come up — a lit room with blackout-level
   // haze in it reads as smoke, not as air.
   const LIGHT_LEVELS = [
-    { id: 'out', label: 'OUT', ambient: 0.18, house: 0.1, sconce: 0.28, downlight: 0.1, fog: 1.15 },
-    { id: 'low', label: 'LOW', ambient: 1, house: 1, sconce: 1, downlight: 1, fog: 1 },
-    { id: 'half', label: 'HALF', ambient: 2.3, house: 2.6, sconce: 1.7, downlight: 2.4, fog: 0.78 },
-    { id: 'full', label: 'FULL', ambient: 3.6, house: 4.2, sconce: 2.2, downlight: 4, fog: 0.6 }
+    { id: 'out', label: 'OUT', ambient: 0.03, house: 0.01, sconce: 0.28, downlight: 0.06, fog: 1.35 },
+    { id: 'low', label: 'LOW', ambient: 0.12, house: 0.08, sconce: 0.5, downlight: 0.3, fog: 1.15 },
+    { id: 'half', label: 'HALF', ambient: 1.5, house: 1.7, sconce: 1.2, downlight: 1.4, fog: 0.88 },
+    { id: 'full', label: 'FULL', ambient: 3.8, house: 4.6, sconce: 2.2, downlight: 4, fog: 0.6 }
   ];
   const SEAT_STORE_KEY = 'jvr.seat.v1';
   // Where in the rake the viewer sits, as a seat row. Row 0 is the default spot
@@ -1435,11 +1452,20 @@
     group.add(ambient);
     // decay 0 drops the inverse-square term and leaves a plain distance window,
     // which is far easier to tune than physical candela for a room this size.
-    const key = new THREE.PointLight(0x9fc4ea, 3.4, 19, 0);
+    //
+    // The window has to be short. With decay 0 the only falloff is the cutoff
+    // term, (1 - (d/cutoff)^4)^2, which stays near 1 until d approaches the
+    // cutoff: at 19 m this light still delivered 86% of full intensity to a
+    // side wall 10 m away and half of it to the middle of the house, which is a
+    // room flood, not a screen wash. It is untagged, so no house-light setting
+    // could take it back down and the walls stayed lit at every level. At 12 m
+    // it lights the proscenium and the stage and is gone by mid-house, which is
+    // how far a real screen throws.
+    const key = new THREE.PointLight(0x9fc4ea, 3.4, 12, 0);
     key.position.set(0, screenY, THEATER.screenWallZ + 2.4);
     group.add(key);
     // Bounce off the stage, so the front rows are not lit from nowhere.
-    const bounce = new THREE.PointLight(0x7f9ec4, 1.2, 16, 0);
+    const bounce = new THREE.PointLight(0x7f9ec4, 1.2, 10, 0);
     bounce.position.set(0, extent.lowY + 1.4, THEATER.screenWallZ + 4.2);
     group.add(bounce);
     const house = new THREE.PointLight(0xffa864, 1.4, 17, 0);

@@ -261,16 +261,35 @@ lights them.
 
 Lighting is one `AmbientLight` and three `PointLight`s, all with **`decay = 0`**.
 That switches off the inverse-square term and leaves a plain distance window,
-which is far easier to tune than physical candela for a room this size. The key
-light sits at the screen with a deliberately short window so the light dies
-before the back of the house; a warm house light lifts the rear. Ambient is kept
-low on purpose — a real auditorium is lit almost entirely by its screen, so the
-falloff has to come from the point lights rather than from a uniform fill.
+which is far easier to tune than physical candela for a room this size. Ambient
+is kept low on purpose — a real auditorium is lit almost entirely by its screen,
+so the falloff has to come from the point lights rather than from a uniform fill.
+
+**The key light's window is the load-bearing number.** With `decay = 0` the only
+falloff left is the cutoff term, `(1 - (d/cutoff)^4)^2`, which stays near 1
+until `d` approaches the cutoff — it is a soft edge, not a gradient. At the
+original 19 m the key still delivered 86% of full intensity to a side wall 10 m
+away and half of it to the middle of the house. Since the key is deliberately
+untagged, no house-light setting could bring that back down, so the walls stayed
+lit at every level and `low` could not read as dark however far the table was
+pushed. At 12 m it lights the proscenium and the stage and is gone by mid-house,
+which is about how far a real screen throws. The bounce follows at 10 m.
 
 The house lights are adjustable at runtime through `LIGHT_LEVELS`, a table of
 multipliers on the intensities and glow opacities the room is built with.
 `applyLightLevel` walks `environmentRoot` and scales every object tagged with
-`userData.jvrLight`, so dimming never rebuilds geometry. The key and bounce
+`userData.jvrLight`, so dimming never rebuilds geometry.
+
+The room is authored at roughly house-lights-up brightness, so every level below
+`full` scales it *down*: `low` is a viewing level, not the as-built state. That
+is the point of the table. `low` is where a film is actually watched, so the
+room has to fall back far enough to stop competing with the screen — walls,
+seats and fixtures stay legible, but as shapes in a dark room rather than as
+things worth looking at. The glow sprites come down less than the lights that
+wash the walls, so the fixtures still read as fixtures once the surfaces around
+them go dark, and the untagged EXIT signs are what keeps the room orientable at
+blackout. The four steps are roughly perceptual, each about three times the one
+below. The key and bounce
 lights are deliberately untagged: they stand in for the picture on the screen,
 so they belong to the film rather than to the house, and raising the house
 lights must not make the screen appear to glow harder.
@@ -492,3 +511,128 @@ Ranked roughly by value-per-effort, all compatible with keeping the 3D path.
 - `stopEncoding` must only ever be handed a `PlaySessionId` we generated. Passing
   Jellyfin's own id would kill the original stream out from under its player.
 - Requires a secure context; `enterVr` bails without HTTPS.
+
+## 11. Test tooling
+
+Two scripts under `tools/`. Neither is shipped to users and neither is imported
+by the plugin; both read the plugin source rather than restating its numbers.
+
+### 11.1 `tools/screen-coverage.py`
+
+Answers "how much of my vision does the screen actually fill". It parses
+`SCREEN_LAYOUTS`, `SEATS`, `THEATER` and `EYE_HEIGHT` out of the plugin and
+replays `computeScreenLayout`, `bendAroundY` and `applySeat`, so the figures
+cannot drift from what the renderer builds.
+
+Coverage is a real solid angle, `Ω = ∬ cos θ / d² dA` integrated over the screen
+surface, not a flat-rectangle approximation — the curve and the off-centre
+elevation at the front and back rows both matter. It is reported against a table
+of reference fields (Quest 2/3, Steam Frame, Index, and human binocular and total
+fields) and against the cinema benchmarks the numbers should be judged by
+(SMPTE EG-18 30°, THX 36°, IMAX 54°+).
+
+It also prints pixels-per-degree for 1080p / 1440p / 4K per eye against the
+headset's own angular resolution. That is the other half of the question: a
+bigger screen is only better until the source can no longer feed it, and
+`FRONT` is exactly where that line is crossed.
+
+    python3 tools/screen-coverage.py --headset frame
+    python3 tools/screen-coverage.py --aspect 2.39 --field quest3
+
+The headset FOV and PPD tables are approximations — vendors quote them loosely
+and they move with face shape and eye relief. They are at the top of the file to
+be edited.
+
+### 11.2 `tools/make-test-video.py`
+
+Generates a suite of procedural test clips, one per mode the plugin supports,
+and encodes them with ffmpeg. There are no image assets: every frame is drawn
+with Pillow, so the tool is self-contained the same way the plugin is.
+
+Three things make it a test rather than a demo:
+
+- **The filenames are the detection test.** Each clip is named so `detectFromText`
+  should land on a specific mode (`vr180` + `sbs`, `mkx200` → fisheye, `_RL` →
+  swapped eyes), and `JVR Test 10 - Unlabelled` deliberately carries no markers
+  so the aspect-ratio fallback in `detectFromAspect` is exercised instead.
+  Dropping the directory into a Jellyfin library tests the whole table at once.
+- **The picture carries the checklist.** Each clip cycles through scripted steps
+  naming the control to press and what should happen, so one pass through the
+  tour clip walks the room, the seats, the light levels, the panel, the source
+  switch and the quality ladder.
+- **Stereo is verifiable, not assumed.** Each eye carries its own L/R badge and a
+  NEAR / SCREEN / FAR triple at crossed, zero and uncrossed disparity. If NEAR
+  reads as furthest, the eyes are swapped. The `RL` clip is packed reversed on
+  purpose so the swap handling has something real to correct.
+
+Per-frame cost is kept down by painting the static card once per eye and
+repainting only three dynamic zones (motion bar, checklist, clock) each frame.
+The zones are laid out in degrees on the sphere clips and in fractions on the
+flat ones, which is why nothing moving ever overlaps anything static.
+
+    python3 tools/make-test-video.py --list
+    python3 tools/make-test-video.py --out ~/media/jvr-tests
+    python3 tools/make-test-video.py --only theater --preview 4   # stills, no ffmpeg
+
+`--preview` writes PNGs instead of encoding, which is the only mode that does not
+need ffmpeg on PATH.
+
+### 11.3 `tools/make-showcase.mjs`
+
+Renders a camera tour of the auditorium to MP4. It does **not** re-create the
+room: `exposePlugin` wraps the plugin source so its IIFE scope can be reached
+from outside, loads it into a headless Chromium page, and drives the real
+`buildTheater` / `applySeat` / `applyLightLevel`. What the video shows is the
+geometry the headset draws, at the same 16 draw calls and ~19k triangles.
+
+The wrapping is two string edits and touches nothing else: prefix an assignment
+onto the opening `(function () {` and inject
+
+```js
+return { run: (code) => eval(code) };
+```
+
+before the closing `})();`. That hands back a direct `eval` bound to the
+plugin's scope — enough to read its constants, swap `updateToolbar` and
+`drawPanel` for stubs (both are called on the way out of `rebuildVideoMeshes`
+and neither exists outside Jellyfin), and call its builders. `currentMode` is a
+`const` object, so it is mutated rather than reassigned.
+
+Camera paths are authored in the auditorium's own coordinates — floor at y = 0,
+viewer at the origin, screen down -z, the frame `THEATER` is written in. That is
+only valid because with the seat on MID the scene graph cancels out: `videoRoot`
+sits at `+EYE_HEIGHT` and `environmentRoot` at `-EYE_HEIGHT`.
+
+Seat shots are filmed differently from the fly-throughs, and deliberately: the
+camera stays at the origin and the room moves, because that is how `applySeat`
+works. Their captions carry the throw and the subtense computed live from
+`computeScreenLayout()` with the same maths as `screen-coverage.py`, so a
+caption cannot claim a framing the render is not showing. The render FOV is not
+the headset's, though — 62° against the Quest's ~110° — so the *numbers* are
+what to read, not the apparent size.
+
+Three constraints the harness exists to work around, all found the hard way:
+
+- **`file://` taints the video.** Chromium gives every file URL an opaque
+  origin, so a video loaded that way cannot be a WebGL texture. The work
+  directory is served over loopback instead, with range support, which the
+  video element requires before it will seek.
+- **Playwright's Chromium has no H.264 decoder.** An MP4 loads its metadata and
+  then fails with `PIPELINE_ERROR_DISCONNECTED`. The screen video is transcoded
+  to VP9 and cached next to the Three.js download.
+- **The GL context has to exist before the decoder starts.** Video decode and
+  WebGL share a process; booting the renderer after the video loses the
+  context. Hence `boot()` and `setScreen()` are separate calls.
+
+`THREE.VideoTexture` only marks itself dirty from `requestVideoFrameCallback`,
+which needs a frame tick that never comes — capture renders on demand rather
+than in a loop — so `renderAt` sets `needsUpdate` itself after each seek.
+
+    node tools/make-showcase.mjs
+    node tools/make-showcase.mjs --stills 12          # contact sheet, no encode
+    node tools/make-showcase.mjs --video "out/JVR Test 01 - Theater Tour (2D).mp4"
+    node tools/make-showcase.mjs --no-video --width 2560 --height 1440
+
+Rendering is software (SwiftShader), so it is far from real time. Needs ffmpeg,
+a Playwright Chromium, and on a minimal Arch install the libraries Chromium
+links against: `atk at-spi2-core libxcomposite libxdamage`.
