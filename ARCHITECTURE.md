@@ -120,6 +120,11 @@ orthogonal to `currentMode`: a separate state slot, `environmentName`, one of
 `jvr.env.v1`. That is deliberately not per-item the way projection is — the room
 you want to sit in is a taste preference, not a property of the file.
 
+Two more global preferences ride along with the room, on the same reasoning:
+`lightLevelId` (`jvr.lights.v1`, one of `out | low | half | full`) and `seatId`
+(`jvr.seat.v1`, one of `front | close | mid | back`). Both are ignored while the
+environment is `void`.
+
 `environmentActive()` (line 771) is the gate: an environment only renders when
 `projection === 'flat'`. The 180/360/fisheye paths wrap the viewer in a
 radius-50 sphere that would swallow any room, so there is nothing to show. The
@@ -131,16 +136,23 @@ screen the room is built around.
 
 ```
 world
- └─ videoRoot            (y = +1.6, rotated by drag-to-pan)
-     ├─ left/right video meshes   layers 1 / 2 (or 0 when mono)
-     └─ environmentRoot  (y = -1.6 → room floor lands at world y = 0)
-         ├─ room shell, seats, aisle lights, 3 lights   layer 0
-         └─ jvr-screen-surround   masking frame + additive bleed
+ └─ videoRoot                (y = +1.6, rotated by drag-to-pan)
+     └─ seatRoot             (offset by the chosen seat row; section 4.7)
+         ├─ left/right video meshes   layers 1 / 2 (or 0 when mono)
+         └─ environmentRoot  (y = -1.6 → room floor lands at world y = 0)
+             ├─ room shell, seats, aisle lights, 3 lights   layer 0
+             └─ jvr-screen-surround   masking frame + additive bleed
 ```
 
 Parenting the room to `videoRoot` rather than to `world` is what keeps the room
 and the screen rotation-locked when the user drags to pan. The -1.6 offset lets
 `buildTheater` be authored in ordinary room coordinates with the floor at y = 0.
+
+`seatRoot` sits between them and holds **both** the room and the screen, which
+is what makes a seat change a move through the auditorium rather than a rescale
+of it. It has to be inside `videoRoot`: `videoRoot`'s origin stays on the head,
+so yaw from drag-to-pan spins the room around the viewer in their seat instead
+of around row 0.
 
 **Everything in the room is on layer 0.** `configureEyeLayers` (line 1595)
 enables layer 0 for both XR eye cameras, so the room is drawn to both eyes and
@@ -214,7 +226,8 @@ back up the rake and never from a seat.
 behind the screen and each seat yaws to face it. The radius is not cosmetic: the
 offset of an outer seat grows as `span² / 2r`, and it has to stay inside the
 half-depth of its own tread or the seat floats off the step. Four seats are
-dropped at each aisle and four more where the viewer is standing.
+dropped at each aisle and four more at whichever row the viewer occupies, which
+`seatPlacements` takes as an argument so a seat change can re-lay the house.
 
 `buildShell` (line 1167) is the room box plus the stage apron and two screen
 speaker stacks. `buildFixtures` (line 1233) adds wall sconces, aisle markers,
@@ -254,19 +267,47 @@ before the back of the house; a warm house light lifts the rear. Ambient is kept
 low on purpose — a real auditorium is lit almost entirely by its screen, so the
 falloff has to come from the point lights rather than from a uniform fill.
 
+The house lights are adjustable at runtime through `LIGHT_LEVELS`, a table of
+multipliers on the intensities and glow opacities the room is built with.
+`applyLightLevel` walks `environmentRoot` and scales every object tagged with
+`userData.jvrLight`, so dimming never rebuilds geometry. The key and bounce
+lights are deliberately untagged: they stand in for the picture on the screen,
+so they belong to the film rather than to the house, and raising the house
+lights must not make the screen appear to glow harder.
+
 `FogExp2` adds depth to the far corners. It is attached and detached with the
 room, because the 180/360 sphere sits at radius 50 and would be fogged into a
 flat wash; the screen and the control panel opt out via `fog: false` on their
-own materials.
+own materials. Its density is part of the lighting preset — haze at blackout
+density in a lit room reads as smoke rather than as air.
+
+### 4.7 Seat selection
+
+The XR runtime owns the camera pose, so the viewer cannot be moved; the room and
+the screen are moved past them instead. `applySeat` sets `seatRoot.position` to
+the negated `rowLevel` of the chosen row, which drops the chosen tread onto the
+real floor and changes the throw to the screen by exactly the rows crossed. The
+four rows are an even 2.5 m ladder, 8.1 m at `front` to 16.9 m at `back`, off a
+screen 8.8 m tall — 88° of horizontal picture down to 50°.
+
+Two details keep it honest. The occupied seat has to be empty, so `refreshSeating`
+rebuilds the one `InstancedMesh` (and only that) when the row changes, keyed on
+`userData.jvrSeatRow`. And the offered rows stop short of the front of the house:
+the rake runs to row -8, but from there the screen is a wall of picture 3 m away.
+
+Off `flat`, `seatRow()` returns 0 — the 180/360 spheres are centred on
+`videoRoot`'s origin and moving the viewer out of them would skew the projection.
 
 ### 4.6 Lifecycle hooks
 
-- `buildRenderer` (line 718) creates the empty `environmentRoot`.
+- `buildRenderer` (line 718) creates the empty `seatRoot` and `environmentRoot`.
 - `rebuildVideoMeshes` (line 1556) recomputes `screenLayout` and calls
   `syncEnvironment` (line 1465) *before* the video-texture guard, so the room
   tracks mode changes even before a texture exists.
 - `buildEnvironment` (line 1451) is idempotent via `environmentBuilt`; the room
   is constructed once and then only shown/hidden.
+- `syncEnvironment` re-applies the light level and the seat offset after every
+  build, because a rebuild resets both back to what the room is authored with.
 - `updateTriggerDrag` clamps pitch to 0 while an environment is active, so
   drag-to-pan is yaw-only and the room cannot be tilted off-level.
 - `closePlayer` disposes the whole `environmentRoot` tree, including
@@ -373,6 +414,10 @@ head-locked until dragged.
   (line 1695): the timeline strip → scrub; the 62 px border → drag the panel in
   space; anything else → button click, or when the panel is hidden,
   drag-to-rotate the video sphere (`videoRoot.rotation`).
+- Row 1 of the panel carries the room controls — environment, `LIGHTS <level>`
+  and `SEAT <row>`, each cycling through its table. The latter two are drawn in a
+  grey and ignored while the environment is `void`, rather than disappearing, so
+  the row does not reflow under a viewer who is aiming at it.
 - Grip toggles the panel; holding grip 1200 ms calls `resetAll` (line 1857).
 - `pollGamepads` (line 1818) reads raw `xrSession.inputSources`: button 4 = play/pause,
   button 5 = panel toggle, thumbstick X = ±10 s with a 650 ms repeat gate.

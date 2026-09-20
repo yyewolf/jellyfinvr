@@ -39,6 +39,30 @@
     { id: '1080', label: '1080', cap: 1920, bitrate: 10000000, note: '1920px frame · 10 Mbps' },
     { id: '720', label: '720', cap: 1280, bitrate: 4000000, note: '1280px frame · 4 Mbps' }
   ];
+  const LIGHT_STORE_KEY = 'jvr.lights.v1';
+  // House lighting presets, as multipliers on what the room is built with. The
+  // screen key and bounce lights are deliberately not in here: they stand in for
+  // the picture itself, so they belong to the film rather than to the house.
+  // `fog` thins the haze as the lights come up — a lit room with blackout-level
+  // haze in it reads as smoke, not as air.
+  const LIGHT_LEVELS = [
+    { id: 'out', label: 'OUT', ambient: 0.18, house: 0.1, sconce: 0.28, downlight: 0.1, fog: 1.15 },
+    { id: 'low', label: 'LOW', ambient: 1, house: 1, sconce: 1, downlight: 1, fog: 1 },
+    { id: 'half', label: 'HALF', ambient: 2.3, house: 2.6, sconce: 1.7, downlight: 2.4, fog: 0.78 },
+    { id: 'full', label: 'FULL', ambient: 3.6, house: 4.2, sconce: 2.2, downlight: 4, fog: 0.6 }
+  ];
+  const SEAT_STORE_KEY = 'jvr.seat.v1';
+  // Where in the rake the viewer sits, as a seat row. Row 0 is the default spot
+  // the room is laid out around, and the four rows are an even 2.5m ladder:
+  // 8.1m to 16.9m of throw off a screen 8.8m tall. The rake itself runs to row
+  // -8, but the offered seats stop well short of it — from the true front row
+  // the top of the picture is 60 degrees up, which is not a seat, it is a stunt.
+  const SEATS = [
+    { id: 'front', label: 'FRONT', row: -4 },
+    { id: 'close', label: 'CLOSE', row: -2 },
+    { id: 'mid', label: 'MID', row: 0 },
+    { id: 'back', label: 'BACK', row: 3 }
+  ];
   // Panel button rows, in canvas pixels. Widths are derived per row so adding a
   // button does not mean re-deriving every x by hand.
   const PANEL_ROW = { left: 55, width: 1490, gap: 18, height: 102, y: [250, 372, 494] };
@@ -105,6 +129,9 @@
   let environmentName = 'theater';
   let environmentRoot = null;
   let environmentBuilt = '';
+  let seatRoot = null;
+  let lightLevelId = 'low';
+  let seatId = 'mid';
   let screenSurround = null;
   let environmentFog = null;
   let screenLayout = { width: 7.2, height: 4.05, y: 0, z: -4.5 };
@@ -542,6 +569,19 @@
     return button;
   }
 
+  function createSelect(id, action, options, label) {
+    const select = document.createElement('select');
+    select.id = id;
+    select.dataset.action = action;
+    options.forEach((option) => {
+      const element = document.createElement('option');
+      element.value = option.id;
+      element.textContent = label(option);
+      select.append(element);
+    });
+    return select;
+  }
+
   function buildOverlay() {
     addStyles();
     overlay = document.createElement('div');
@@ -561,20 +601,14 @@
       .forEach(([label, value]) => bar.append(createButton(label, 'stereo', value)));
     [['Void', 'void'], ['Theater', 'theater']]
       .forEach(([label, value]) => bar.append(createButton(label, 'environment', value)));
+    bar.append(createSelect('jvr-lights-select', 'lights', LIGHT_LEVELS, (level) => `Lights: ${level.label}`));
+    bar.append(createSelect('jvr-seat-select', 'seat', SEATS, (seat) => `Seat: ${seat.label}`));
     bar.append(createButton('Swap Eyes', 'swap'));
     const source = createButton('Original Source', 'source');
     source.id = 'jvr-source-toggle';
     bar.append(source);
-    const quality = document.createElement('select');
-    quality.id = 'jvr-quality-select';
-    quality.dataset.action = 'quality';
-    QUALITY_PRESETS.forEach((preset) => {
-      const option = document.createElement('option');
-      option.value = preset.id;
-      option.textContent = `Quality: ${preset.label}`;
-      option.title = preset.note;
-      quality.append(option);
-    });
+    const quality = createSelect('jvr-quality-select', 'quality', QUALITY_PRESETS, (preset) => `Quality: ${preset.label}`);
+    QUALITY_PRESETS.forEach((preset, index) => { quality.options[index].title = preset.note; });
     bar.append(quality);
     const enter = createButton('Enter VR', 'enter');
     enter.className = 'jvr-enter';
@@ -749,9 +783,14 @@
       { label: currentMode.projection.toUpperCase(), action: 'projection' },
       { label: currentMode.stereo.toUpperCase(), action: 'stereo' }
     ]);
+    // Lights and seat only mean anything inside a room; off it they stay on the
+    // panel, greyed, rather than moving the buttons around under the viewer.
+    const roomColor = environmentActive() ? '#2d4a40' : '#1e242b';
     addPanelRow(1, [
       { label: 'SWAP EYES', action: 'swap' },
       { label: environmentName.toUpperCase(), action: 'environment', color: '#2d4a40' },
+      { label: `LIGHTS ${currentLightLevel().label}`, action: 'lights', color: roomColor },
+      { label: `SEAT ${currentSeat().label}`, action: 'seat', color: roomColor },
       { label: sourceMode === 'compat' ? 'H264' : 'SOURCE', action: 'source', color: '#25536a' },
       { label: currentQuality().label, action: 'quality', color: '#25536a' }
     ]);
@@ -786,12 +825,19 @@
     videoRoot.name = 'jvr-video-view-root';
     videoRoot.position.set(0, EYE_HEIGHT, 0);
     world.add(videoRoot);
+    // Everything the viewer can walk away from hangs off seatRoot: moving seats
+    // means moving the room and the screen together, past a viewer whose pose
+    // the XR runtime owns. videoRoot keeps its origin on the head, so aiming the
+    // view still spins the room around the viewer rather than around row 0.
+    seatRoot = new THREE.Group();
+    seatRoot.name = 'jvr-seat-root';
+    videoRoot.add(seatRoot);
     environmentRoot = new THREE.Group();
     environmentRoot.name = 'jvr-environment-root';
     environmentRoot.position.set(0, -EYE_HEIGHT, 0);
     environmentRoot.visible = false;
     environmentBuilt = '';
-    videoRoot.add(environmentRoot);
+    seatRoot.add(environmentRoot);
     renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false, powerPreference: 'high-performance' });
     renderer.outputColorSpace = THREE.SRGBColorSpace;
     renderer.setPixelRatio(Math.min(devicePixelRatio || 1, 2));
@@ -1148,7 +1194,7 @@
     ]);
   }
 
-  function seatPlacements() {
+  function seatPlacements(occupiedRow) {
     const placements = [];
     const count = Math.floor((THEATER.seatHalfSpan * 2) / THEATER.seatPitch);
     for (let row = -THEATER.rowsFront; row <= THEATER.rowsBack; row += 1) {
@@ -1158,8 +1204,8 @@
         const arc = (seat - (count - 1) / 2) * THEATER.seatPitch;
         const distance = Math.abs(arc);
         if (distance >= THEATER.aisleInner && distance <= THEATER.aisleOuter) continue;
-        // Leave the viewer's own spot clear; they are standing in it.
-        if (row === 0 && distance < THEATER.standingGap) continue;
+        // Leave the viewer's own spot clear; they are sitting in it.
+        if (row === occupiedRow && distance < THEATER.standingGap) continue;
         const angle = arc / radius;
         placements.push({
           x: radius * Math.sin(angle),
@@ -1173,7 +1219,7 @@
   }
 
   function buildSeating(group) {
-    const placements = seatPlacements();
+    const placements = seatPlacements(seatRow());
     const seats = new THREE.InstancedMesh(
       makeSeatGeometry(),
       new THREE.MeshLambertMaterial({ vertexColors: true }),
@@ -1192,6 +1238,7 @@
     seats.instanceMatrix.needsUpdate = true;
     // The bounding sphere of a single seat would cull the whole house.
     seats.name = 'jvr-theater-seats';
+    seats.userData.jvrSeatRow = seatRow();
     seats.frustumCulled = false;
     seats.layers.set(0);
     group.add(seats);
@@ -1323,6 +1370,7 @@
     }
     const lamps = new THREE.Mesh(mergeParts(lampParts), glowMaterial);
     lamps.name = 'jvr-theater-lamps';
+    lamps.userData.jvrLight = { role: 'sconce', base: 1 };
     lamps.layers.set(0);
     lamps.renderOrder = 2;
     group.add(lamps);
@@ -1349,6 +1397,7 @@
     );
     downlights.material.map.needsUpdate = true;
     downlights.name = 'jvr-theater-downlights';
+    downlights.userData.jvrLight = { role: 'downlight', base: 0.35 };
     downlights.layers.set(0);
     group.add(downlights);
 
@@ -1381,7 +1430,9 @@
     // Ambient only keeps the far corners off pure black: a real auditorium is
     // lit almost entirely by the screen, so the falloff has to come from the
     // point lights, not from a uniform fill.
-    group.add(new THREE.AmbientLight(0x35435c, 1));
+    const ambient = new THREE.AmbientLight(0x35435c, 1);
+    ambient.userData.jvrLight = { role: 'ambient', base: 1 };
+    group.add(ambient);
     // decay 0 drops the inverse-square term and leaves a plain distance window,
     // which is far easier to tune than physical candela for a room this size.
     const key = new THREE.PointLight(0x9fc4ea, 3.4, 19, 0);
@@ -1393,7 +1444,101 @@
     group.add(bounce);
     const house = new THREE.PointLight(0xffa864, 1.4, 17, 0);
     house.position.set(0, extent.highY + 2.6, THEATER.backWallZ - 2);
+    house.userData.jvrLight = { role: 'house', base: 1.4 };
     group.add(house);
+  }
+
+  // --- house lights and seating -------------------------------------------
+
+  function currentLightLevel() {
+    return LIGHT_LEVELS.find((level) => level.id === lightLevelId) || LIGHT_LEVELS[1];
+  }
+
+  function currentSeat() {
+    return SEATS.find((seat) => seat.id === seatId) || SEATS[2];
+  }
+
+  // Off the flat screen there is no room to sit in, so the viewer stays on the
+  // origin the 180/360 spheres are centred on.
+  function seatRow() {
+    return environmentActive() ? currentSeat().row : 0;
+  }
+
+  // Scales every tagged light and glow sprite in place. The room is a few
+  // thousand merged triangles and rebuilding it would drop frames, so dimming
+  // touches only intensities and opacities.
+  function applyLightLevel() {
+    const level = currentLightLevel();
+    environmentRoot?.traverse((object) => {
+      const tag = object.userData?.jvrLight;
+      if (!tag) return;
+      const scale = level[tag.role] ?? 1;
+      if (object.isLight) object.intensity = tag.base * scale;
+      // Additive glow: opacity is the only knob, so it clamps rather than
+      // letting a bright preset push it past full.
+      else if (object.material) object.material.opacity = Math.min(1, tag.base * scale);
+    });
+    if (environmentFog) environmentFog.density = 0.016 * (level.fog ?? 1);
+  }
+
+  // The seat the viewer occupies has to be empty, which the house is built
+  // with, so a move rebuilds the one instanced seat mesh and nothing else.
+  function refreshSeating() {
+    if (!environmentRoot || environmentBuilt !== 'theater') return;
+    const existing = environmentRoot.getObjectByName('jvr-theater-seats');
+    if (existing?.userData.jvrSeatRow === seatRow()) return;
+    if (existing) {
+      environmentRoot.remove(existing);
+      disposeTree(existing);
+    }
+    buildSeating(environmentRoot);
+  }
+
+  function applySeat() {
+    if (!seatRoot) return;
+    const level = rowLevel(seatRow());
+    // The viewer cannot be moved, so the room and the screen move past them:
+    // the chosen row's tread lands on the real floor, and the screen gets
+    // nearer or further by exactly the rows crossed.
+    seatRoot.position.set(0, -level.y, -level.z);
+    refreshSeating();
+  }
+
+  function readStoredChoice(key, options, fallback) {
+    try {
+      const value = localStorage.getItem(key);
+      return options.some((option) => option.id === value) ? value : fallback;
+    } catch (_) {
+      return fallback;
+    }
+  }
+
+  function applyLights(id, remember = true) {
+    if (!LIGHT_LEVELS.some((level) => level.id === id)) return;
+    lightLevelId = id;
+    if (remember) { try { localStorage.setItem(LIGHT_STORE_KEY, lightLevelId); } catch (_) {} }
+    applyLightLevel();
+    updateToolbar();
+    drawPanel();
+  }
+
+  function applySeatChoice(id, remember = true) {
+    if (!SEATS.some((seat) => seat.id === id)) return;
+    seatId = id;
+    if (remember) { try { localStorage.setItem(SEAT_STORE_KEY, seatId); } catch (_) {} }
+    applySeat();
+    updateToolbar();
+    drawPanel();
+  }
+
+  function cycleLights() {
+    const index = LIGHT_LEVELS.findIndex((level) => level.id === lightLevelId);
+    applyLights(LIGHT_LEVELS[(index + 1) % LIGHT_LEVELS.length].id);
+  }
+
+  function cycleSeat() {
+    const index = SEATS.findIndex((seat) => seat.id === seatId);
+    applySeatChoice(SEATS[(index + 1) % SEATS.length].id);
   }
 
   function buildTheater(group) {
@@ -1532,6 +1677,8 @@
     // The screen and the panel opt out via `fog: false` on their own materials.
     if (active && !environmentFog) environmentFog = new THREE.FogExp2(0x05060a, 0.016);
     if (world) world.fog = active ? environmentFog : null;
+    applyLightLevel();
+    applySeat();
     // A room has a horizon; keep it level even if the view was pitched earlier.
     if (environmentActive() && videoRoot) videoRoot.rotation.x = 0;
   }
@@ -1605,7 +1752,7 @@
 
   function disposeVideoMeshes() {
     videoMeshes.forEach((mesh) => {
-      videoRoot?.remove(mesh);
+      mesh.parent?.remove(mesh);
       mesh.geometry?.dispose();
       mesh.material?.dispose();
     });
@@ -1624,7 +1771,7 @@
       if (currentMode.projection === 'flat') left.position.set(0, screenLayout.y, screenLayout.z);
       else if (currentMode.projection !== '360') left.rotation.y = Math.PI / 2;
       left.layers.set(stereo ? 1 : 0);
-      videoRoot.add(left);
+      seatRoot.add(left);
       videoMeshes.push(left);
       if (stereo) {
         const right = new THREE.Mesh(makeGeometry(currentMode.projection, 1), makeMaterial(1));
@@ -1632,7 +1779,7 @@
         if (currentMode.projection === 'flat') right.position.set(0, screenLayout.y, screenLayout.z);
         else if (currentMode.projection !== '360') right.rotation.y = Math.PI / 2;
         right.layers.set(2);
-        videoRoot.add(right);
+        seatRoot.add(right);
         videoMeshes.push(right);
       }
     }
@@ -2183,6 +2330,8 @@
     else if (action === 'projection') cycleProjection();
     else if (action === 'stereo') cycleStereo();
     else if (action === 'environment') cycleEnvironment();
+    else if (action === 'lights') { if (environmentActive()) cycleLights(); }
+    else if (action === 'seat') { if (environmentActive()) cycleSeat(); }
     else if (action === 'swap') applyMode({ swap: !currentMode.swap }, true);
     else if (action === 'source') toggleSource();
     else if (action === 'quality') cycleQuality();
@@ -2209,6 +2358,16 @@
       sourceButton.textContent = sourceMode === 'compat' ? 'H.264 Compat ✓' : 'Original Source';
       sourceButton.classList.toggle('active', sourceMode === 'compat');
       sourceButton.disabled = !compatUrl;
+    }
+    const lightsSelect = overlay.querySelector('#jvr-lights-select');
+    if (lightsSelect) {
+      lightsSelect.value = lightLevelId;
+      lightsSelect.disabled = !environmentActive();
+    }
+    const seatSelect = overlay.querySelector('#jvr-seat-select');
+    if (seatSelect) {
+      seatSelect.value = seatId;
+      seatSelect.disabled = !environmentActive();
     }
     const qualitySelect = overlay.querySelector('#jvr-quality-select');
     if (qualitySelect) {
@@ -2264,8 +2423,11 @@
   }
 
   function handleToolbarChange(event) {
-    const select = event.target.closest('select[data-action="quality"]');
-    if (select) applyQuality(select.value);
+    const select = event.target.closest('select[data-action]');
+    if (!select) return;
+    if (select.dataset.action === 'quality') applyQuality(select.value);
+    else if (select.dataset.action === 'lights') applyLights(select.value);
+    else if (select.dataset.action === 'seat') applySeatChoice(select.value);
   }
 
   async function openPlayer() {
@@ -2281,6 +2443,8 @@
       itemText = '';
       detectionMessage = '';
       environmentName = readStoredEnvironment();
+      lightLevelId = readStoredChoice(LIGHT_STORE_KEY, LIGHT_LEVELS, 'low');
+      seatId = readStoredChoice(SEAT_STORE_KEY, SEATS, 'mid');
       qualityId = readStoredQuality();
       detectionTimer = setTimeout(() => {
         itemTextReady = true;
@@ -2392,6 +2556,7 @@
     videoTexture = null;
     videoMeshes = [];
     videoRoot = null;
+    seatRoot = null;
     environmentRoot = null;
     environmentBuilt = '';
     screenSurround = null;
