@@ -259,8 +259,8 @@
     };
     const client = window.ApiClient;
     if (client) {
-      try { if (!context.apiKey) context.apiKey = client.accessToken?.() || ''; } catch (_) {}
-      try { if (!context.deviceId) context.deviceId = client.deviceId?.() || ''; } catch (_) {}
+      try { if (!context.apiKey) context.apiKey = client.accessToken?.() || ''; } catch (_) { }
+      try { if (!context.deviceId) context.deviceId = client.deviceId?.() || ''; } catch (_) { }
     }
     return context.apiKey ? context : null;
   }
@@ -318,7 +318,7 @@
 
   function newCompatSessionId() {
     let random = '';
-    try { random = crypto.randomUUID().replace(/-/g, ''); } catch (_) {}
+    try { random = crypto.randomUUID().replace(/-/g, ''); } catch (_) { }
     if (!random) random = `${Date.now().toString(16)}${Math.random().toString(16).slice(2)}`;
     return `jvr${random}`.slice(0, 40);
   }
@@ -447,7 +447,7 @@
       const keys = Object.keys(store);
       for (const key of keys.slice(0, Math.max(0, keys.length - MODE_STORE_LIMIT))) delete store[key];
       localStorage.setItem(MODE_STORE_KEY, JSON.stringify(store));
-    } catch (_) {}
+    } catch (_) { }
   }
 
   function applyMode(changes, remember) {
@@ -495,7 +495,7 @@
     itemText = document.title || '';
     if (jellyfin?.itemId) {
       let userId = '';
-      try { userId = window.ApiClient?.getCurrentUserId?.() || ''; } catch (_) {}
+      try { userId = window.ApiClient?.getCurrentUserId?.() || ''; } catch (_) { }
       const routes = [];
       if (userId) routes.push(`/Users/${userId}/Items/${jellyfin.itemId}`);
       routes.push(`/Items/${jellyfin.itemId}`);
@@ -885,7 +885,7 @@
   }
 
   function rememberEnvironment() {
-    try { localStorage.setItem(ENV_STORE_KEY, environmentName); } catch (_) {}
+    try { localStorage.setItem(ENV_STORE_KEY, environmentName); } catch (_) { }
   }
 
   // An environment is only meaningful behind a flat screen: 180/360/fisheye wrap
@@ -1344,9 +1344,9 @@
       plane(THEATER.wallX * 2, 2.4, [0, stageTop, THEATER.screenWallZ + 1.2], [-Math.PI / 2, 0]),
       plane(THEATER.wallX * 2, THEATER.stageHeight, [0, stageTop - THEATER.stageHeight / 2, THEATER.screenWallZ + 2.4], [0, 0])
     ];
-    for (const side of [-1, 1]) {
-      stageParts.push(box(0.75, 1.9, 0.6, [side * 6.6, stageTop + 0.95, THEATER.screenWallZ + 0.9]));
-    }
+    // for (const side of [-1, 1]) {
+    //   stageParts.push(box(0.75, 1.9, 0.6, [side * 6.6, stageTop + 0.95, THEATER.screenWallZ + 0.9]));
+    // }
     const stage = new THREE.Mesh(mergeParts(stageParts), new THREE.MeshLambertMaterial({ color: 0x16181d }));
     stage.name = 'jvr-theater-stage';
     stage.layers.set(0);
@@ -1542,7 +1542,7 @@
   function applyLights(id, remember = true) {
     if (!LIGHT_LEVELS.some((level) => level.id === id)) return;
     lightLevelId = id;
-    if (remember) { try { localStorage.setItem(LIGHT_STORE_KEY, lightLevelId); } catch (_) {} }
+    if (remember) { try { localStorage.setItem(LIGHT_STORE_KEY, lightLevelId); } catch (_) { } }
     applyLightLevel();
     updateToolbar();
     drawPanel();
@@ -1551,7 +1551,7 @@
   function applySeatChoice(id, remember = true) {
     if (!SEATS.some((seat) => seat.id === id)) return;
     seatId = id;
-    if (remember) { try { localStorage.setItem(SEAT_STORE_KEY, seatId); } catch (_) {} }
+    if (remember) { try { localStorage.setItem(SEAT_STORE_KEY, seatId); } catch (_) { } }
     applySeat();
     updateToolbar();
     drawPanel();
@@ -2198,7 +2198,7 @@
   }
 
   function rememberQuality() {
-    try { localStorage.setItem(QUALITY_STORE_KEY, qualityId); } catch (_) {}
+    try { localStorage.setItem(QUALITY_STORE_KEY, qualityId); } catch (_) { }
   }
 
   // The cap is square rather than 16:9 on purpose. Jellyfin scales to fit the
@@ -2307,7 +2307,7 @@
     replaceVideoTexture(activeVideo);
     updateToolbar();
     statusEl.textContent = 'Switched back to the original source.';
-    if (shouldPlay) await sourceVideo.play().catch(() => {});
+    if (shouldPlay) await sourceVideo.play().catch(() => { });
   }
 
   function toggleSource() {
@@ -2349,7 +2349,7 @@
 
   function runAction(action) {
     if (!activeVideo) return;
-    if (action === 'play') activeVideo.paused ? activeVideo.play().catch(() => {}) : activeVideo.pause();
+    if (action === 'play') activeVideo.paused ? activeVideo.play().catch(() => { }) : activeVideo.pause();
     else if (action === 'back') seekAbsolute(getCurrentTime() - 10);
     else if (action === 'forward') seekAbsolute(getCurrentTime() + 10);
     else if (action === 'mute') activeVideo.muted = !activeVideo.muted;
@@ -2412,7 +2412,7 @@
       const sessionPromise = navigator.xr.requestSession('immersive-vr', {
         optionalFeatures: ['local-floor', 'bounded-floor', 'hand-tracking']
       });
-      activeVideo?.play?.().catch(() => {});
+      activeVideo?.play?.().catch(() => { });
       xrSession = await sessionPromise;
       xrSession.addEventListener('end', () => {
         xrSession = null;
@@ -2431,7 +2431,7 @@
     try {
       const session = xrSession || renderer?.xr?.getSession?.();
       if (session) await session.end();
-    } catch (_) {}
+    } catch (_) { }
     if (closeAfter) closePlayer();
   }
 
@@ -2493,7 +2493,7 @@
       replaceVideoTexture(sourceVideo);
       updateToolbar();
       statusEl.textContent = `Native WebXR ready · ${sourceVideo.videoWidth || '?'}×${sourceVideo.videoHeight || '?'}${detectionMessage ? ` · ${detectionMessage}` : ''}`;
-      sourceVideo.play().catch(() => {});
+      sourceVideo.play().catch(() => { });
     } catch (error) {
       closePlayer();
       alert(`VR player failed to initialise: ${error?.message || error}`);
@@ -2510,7 +2510,7 @@
     stopProgressReporting();
     stopCompatEncoding();
     const session = xrSession || renderer?.xr?.getSession?.();
-    session?.end?.().catch?.(() => {});
+    session?.end?.().catch?.(() => { });
     xrSession = null;
     ++loadSerial;
     bindMediaEvents(activeVideo, false);
@@ -2527,7 +2527,7 @@
       if (typeof finalMuted === 'boolean') sourceVideo.muted = finalMuted;
       if (Number.isFinite(finalVolume)) sourceVideo.volume = finalVolume;
       sourceVideo.id = savedVideoId;
-      sourceVideo.play().catch(() => {});
+      sourceVideo.play().catch(() => { });
     }
     renderer?.setAnimationLoop?.(null);
     disposeVideoMeshes();
